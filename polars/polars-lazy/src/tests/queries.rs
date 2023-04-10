@@ -1,4 +1,5 @@
 use polars_core::frame::explode::MeltArgs;
+#[cfg(feature = "diff")]
 use polars_core::series::ops::NullBehavior;
 
 use super::*;
@@ -50,10 +51,9 @@ fn test_lazy_melt() {
     let df = get_df();
 
     let args = MeltArgs {
-        id_vars: vec!["petal.width".to_string(), "petal.length".to_string()],
-        value_vars: vec!["sepal.length".to_string(), "sepal.width".to_string()],
-        variable_name: None,
-        value_name: None,
+        id_vars: vec!["petal.width".into(), "petal.length".into()],
+        value_vars: vec!["sepal.length".into(), "sepal.width".into()],
+        ..Default::default()
     };
 
     let out = df
@@ -545,7 +545,7 @@ fn test_simplify_expr() {
     lp_top = optimizer
         .optimize_loop(rules, &mut expr_arena, &mut lp_arena, lp_top)
         .unwrap();
-    let plan = node_to_lp(lp_top, &mut expr_arena, &mut lp_arena);
+    let plan = node_to_lp(lp_top, &expr_arena, &mut lp_arena);
     assert!(
         matches!(plan, LogicalPlan::Projection{ expr, ..} if matches!(&expr[0], Expr::BinaryExpr{left, ..} if **left == Expr::Literal(LiteralValue::Float32(2.0))))
     );
@@ -1206,7 +1206,7 @@ fn test_exclude() -> PolarsResult<()> {
     "c" => [1, 2, 3]
     ]?;
 
-    let out = df.lazy().select([col("*").exclude(&["b"])]).collect()?;
+    let out = df.lazy().select([col("*").exclude(["b"])]).collect()?;
 
     assert_eq!(out.get_column_names(), &["a", "c"]);
     Ok(())
@@ -1559,15 +1559,19 @@ fn test_exclude_regex() -> PolarsResult<()> {
 }
 
 #[test]
+#[cfg(feature = "rank")]
 fn test_groupby_rank() -> PolarsResult<()> {
     let df = fruits_cars();
     let out = df
         .lazy()
         .groupby_stable([col("cars")])
-        .agg([col("B").rank(RankOptions {
-            method: RankMethod::Dense,
-            ..Default::default()
-        })])
+        .agg([col("B").rank(
+            RankOptions {
+                method: RankMethod::Dense,
+                ..Default::default()
+            },
+            None,
+        )])
         .collect()?;
 
     let out = out.column("B")?;
@@ -1648,6 +1652,7 @@ fn test_single_group_result() -> PolarsResult<()> {
 }
 
 #[test]
+#[cfg(feature = "rank")]
 fn test_single_ranked_group() -> PolarsResult<()> {
     // tests type consistency of rank algorithm
     let df = df!["group" => [1, 2, 2],
@@ -1657,10 +1662,13 @@ fn test_single_ranked_group() -> PolarsResult<()> {
     let out = df
         .lazy()
         .with_columns([col("value")
-            .rank(RankOptions {
-                method: RankMethod::Average,
-                ..Default::default()
-            })
+            .rank(
+                RankOptions {
+                    method: RankMethod::Average,
+                    ..Default::default()
+                },
+                None,
+            )
             .list()
             .over([col("group")])])
         .collect()?;
@@ -1676,6 +1684,7 @@ fn test_single_ranked_group() -> PolarsResult<()> {
 }
 
 #[test]
+#[cfg(feature = "diff")]
 fn empty_df() -> PolarsResult<()> {
     let df = fruits_cars();
     let df = df.filter(&BooleanChunked::full("", false, df.height()))?;

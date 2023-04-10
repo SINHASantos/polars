@@ -30,9 +30,7 @@ impl DateLikeNameSpace {
                     let ca = s.duration().unwrap();
                     Ok(Some(ca.cast_time_unit(tu).into_series()))
                 }
-                dt => Err(PolarsError::ComputeError(
-                    format!("Series of dtype {dt:?} has got no time unit").into(),
-                )),
+                dt => polars_bail!(ComputeError: "dtype `{}` has no time unit", dt),
             },
             GetOutput::map_dtype(move |dtype| match dtype {
                 DataType::Duration(_) => DataType::Duration(tu),
@@ -57,9 +55,7 @@ impl DateLikeNameSpace {
                     ca.set_time_unit(tu);
                     Ok(Some(ca.into_series()))
                 }
-                dt => Err(PolarsError::ComputeError(
-                    format!("Series of dtype {dt:?} has got no time unit").into(),
-                )),
+                dt => polars_bail!(ComputeError: "dtype `{}` has no time unit", dt),
             },
             GetOutput::same_type(),
         )
@@ -76,9 +72,11 @@ impl DateLikeNameSpace {
                     ca.set_time_zone(time_zone.clone())?;
                     Ok(Some(ca.into_series()))
                 }
-                _ => Err(PolarsError::ComputeError(
-                    "Cannot call convert_time_zone on tz-naive. Set a time zone first with replace_time_zone".into()
-                )),
+                _ => polars_bail!(
+                    ComputeError:
+                    "cannot call `convert_time_zone` on tz-naive; set a time zone first \
+                    with `replace_time_zone`"
+                ),
             },
             GetOutput::map_dtype(move |dtype| match dtype {
                 DataType::Datetime(tu, _) => DataType::Datetime(*tu, Some(time_zone_clone.clone())),
@@ -102,6 +100,12 @@ impl DateLikeNameSpace {
     pub fn year(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Year))
+    }
+
+    // Compute whether the year of a Date/Datetime is a leap year.
+    pub fn is_leap_year(self) -> Expr {
+        self.0
+            .map_private(FunctionExpr::TemporalExpr(TemporalFunction::IsLeapYear))
     }
 
     /// Get the iso-year of a Date/Datetime.
@@ -153,6 +157,24 @@ impl DateLikeNameSpace {
     pub fn ordinal_day(self) -> Expr {
         self.0
             .map_private(FunctionExpr::TemporalExpr(TemporalFunction::OrdinalDay))
+    }
+
+    /// Get the (local) time of a Date/Datetime/Time
+    pub fn time(self) -> Expr {
+        self.0
+            .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Time))
+    }
+
+    /// Get the (local) date of a Date/Datetime
+    pub fn date(self) -> Expr {
+        self.0
+            .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Date))
+    }
+
+    /// Get the (local) datetime of a Datetime
+    pub fn datetime(self) -> Expr {
+        self.0
+            .map_private(FunctionExpr::TemporalExpr(TemporalFunction::Datetime))
     }
 
     /// Get the hour of a Datetime/Time64

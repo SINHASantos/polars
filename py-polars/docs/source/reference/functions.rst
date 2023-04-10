@@ -15,6 +15,7 @@ Conversion
     from_numpy
     from_pandas
     from_records
+    from_repr
 
 Eager/Lazy functions
 ~~~~~~~~~~~~~~~~~~~~
@@ -42,12 +43,11 @@ Parallelization
    :toctree: api/
 
    collect_all
-   threadpool_size
 
 StringCache
 ~~~~~~~~~~~
 .. autosummary::
    :toctree: api/
 
-    toggle_string_cache
+    enable_string_cache
     StringCache

@@ -1,8 +1,12 @@
+#[cfg(feature = "timezones")]
+use arrow::temporal_conversions::parse_offset;
 use chrono::{Datelike, NaiveDateTime};
 use polars_core::prelude::*;
 use polars_core::series::IsSorted;
 
 use crate::prelude::*;
+#[cfg(feature = "timezones")]
+use crate::utils::localize_timestamp;
 
 pub fn in_nanoseconds_window(ndt: &NaiveDateTime) -> bool {
     // ~584 year around 1970
@@ -20,19 +24,45 @@ pub fn date_range_impl(
     tu: TimeUnit,
     _tz: Option<&TimeZone>,
 ) -> PolarsResult<DatetimeChunked> {
-    let mut out = Int64Chunked::new_vec(name, date_range_vec(start, stop, every, closed, tu))
-        .into_datetime(tu, None);
-
-    #[cfg(feature = "timezones")]
-    if let Some(tz) = _tz {
-        out = out.replace_time_zone(Some(tz))?
+    if start > stop {
+        polars_bail!(ComputeError: "'start' cannot be greater than 'stop'")
     }
-    let s = if start > stop {
-        IsSorted::Descending
-    } else {
-        IsSorted::Ascending
+    if every.negative {
+        polars_bail!(ComputeError: "'interval' cannot be negative")
+    }
+    let mut out = match _tz {
+        #[cfg(feature = "timezones")]
+        Some(tz) => match tz.parse::<chrono_tz::Tz>() {
+            Ok(tz) => {
+                let start = localize_timestamp(start, tu, tz);
+                let stop = localize_timestamp(stop, tu, tz);
+                Int64Chunked::new_vec(
+                    name,
+                    date_range_vec(start?, stop?, every, closed, tu, Some(&tz))?,
+                )
+                .into_datetime(tu, _tz.cloned())
+            }
+            Err(_) => match parse_offset(tz) {
+                Ok(tz) => {
+                    let start = localize_timestamp(start, tu, tz);
+                    let stop = localize_timestamp(stop, tu, tz);
+                    Int64Chunked::new_vec(
+                        name,
+                        date_range_vec(start?, stop?, every, closed, tu, Some(&tz))?,
+                    )
+                    .into_datetime(tu, _tz.cloned())
+                }
+                _ => polars_bail!(ComputeError: "unable to parse time zone: '{}'", tz),
+            },
+        },
+        _ => Int64Chunked::new_vec(
+            name,
+            date_range_vec(start, stop, every, closed, tu, NO_TIMEZONE)?,
+        )
+        .into_datetime(tu, None),
     };
-    out.set_sorted_flag(s);
+
+    out.set_sorted_flag(IsSorted::Ascending);
     Ok(out)
 }
 

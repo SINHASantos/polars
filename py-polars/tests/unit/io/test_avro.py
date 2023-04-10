@@ -11,7 +11,7 @@ import polars as pl
 from polars.testing import assert_frame_equal
 
 if TYPE_CHECKING:
-    from polars.internals.type_aliases import AvroCompression
+    from polars.type_aliases import AvroCompression
 
 COMPRESSIONS = ["uncompressed", "snappy", "deflate"]
 
@@ -31,6 +31,7 @@ def test_from_to_buffer(example_df: pl.DataFrame, compression: AvroCompression) 
     assert_frame_equal(example_df, read_df)
 
 
+@pytest.mark.write_disk()
 @pytest.mark.parametrize("compression", COMPRESSIONS)
 def test_from_to_file(example_df: pl.DataFrame, compression: AvroCompression) -> None:
     with tempfile.TemporaryDirectory() as temp_dir:

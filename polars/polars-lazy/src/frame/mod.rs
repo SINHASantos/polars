@@ -40,7 +40,8 @@ use polars_plan::global::FETCH_ROWS;
 #[cfg(any(feature = "ipc", feature = "parquet", feature = "csv-file"))]
 use polars_plan::logical_plan::collect_fingerprints;
 use polars_plan::logical_plan::optimize;
-use polars_plan::utils::{combine_predicates_expr, expr_to_leaf_column_names};
+use polars_plan::utils::expr_to_leaf_column_names;
+use smartstring::alias::String as SmartString;
 
 use crate::physical_plan::executors::Executor;
 use crate::physical_plan::planner::create_physical_plan;
@@ -251,6 +252,36 @@ impl LazyFrame {
         }
     }
 
+    pub fn top_k<E: AsRef<[Expr]>, B: AsRef<[bool]>>(
+        self,
+        k: IdxSize,
+        by_exprs: E,
+        descending: B,
+        nulls_last: bool,
+    ) -> Self {
+        let mut descending = descending.as_ref().to_vec();
+        // top-k is reverse from sort
+        for v in &mut descending {
+            *v = !*v;
+        }
+        // this will optimize to top-k
+        self.sort_by_exprs(by_exprs, descending, nulls_last)
+            .slice(0, k)
+    }
+
+    pub fn bottom_k<E: AsRef<[Expr]>, B: AsRef<[bool]>>(
+        self,
+        k: IdxSize,
+        by_exprs: E,
+        descending: B,
+        nulls_last: bool,
+    ) -> Self {
+        let descending = descending.as_ref().to_vec();
+        // this will optimize to bottom-k
+        self.sort_by_exprs(by_exprs, descending, nulls_last)
+            .slice(0, k)
+    }
+
     /// Reverse the DataFrame
     ///
     /// # Example
@@ -270,7 +301,7 @@ impl LazyFrame {
 
     /// Check the if the `names` are available in the `schema`, if not
     /// return a `LogicalPlan` that raises an `Error`.
-    fn check_names(&self, names: &[String], schema: Option<&SchemaRef>) -> Option<Self> {
+    fn check_names(&self, names: &[SmartString], schema: Option<&SchemaRef>) -> Option<Self> {
         let schema = schema
             .map(Cow::Borrowed)
             .unwrap_or_else(|| Cow::Owned(self.schema().unwrap()));
@@ -288,7 +319,7 @@ impl LazyFrame {
             let lp = self
                 .clone()
                 .get_plan_builder()
-                .add_err(PolarsError::SchemaFieldNotFound(name.to_string().into()))
+                .add_err(polars_err!(SchemaFieldNotFound: "{}", name))
                 .build();
             Some(Self::from_logical_plan(lp, self.opt_state))
         } else {
@@ -306,16 +337,16 @@ impl LazyFrame {
     {
         let iter = existing.into_iter();
         let cap = iter.size_hint().0;
-        let mut existing_vec = Vec::with_capacity(cap);
-        let mut new_vec = Vec::with_capacity(cap);
+        let mut existing_vec: Vec<SmartString> = Vec::with_capacity(cap);
+        let mut new_vec: Vec<SmartString> = Vec::with_capacity(cap);
 
         for (existing, new) in iter.zip(new.into_iter()) {
             let existing = existing.as_ref();
             let new = new.as_ref();
 
             if new != existing {
-                existing_vec.push(existing.to_string());
-                new_vec.push(new.to_string());
+                existing_vec.push(existing.into());
+                new_vec.push(new.into());
             }
         }
 
@@ -342,15 +373,15 @@ impl LazyFrame {
         I: IntoIterator<Item = T>,
         T: AsRef<str>,
     {
-        let columns: Vec<String> = columns
+        let columns: Vec<SmartString> = columns
             .into_iter()
-            .map(|name| name.as_ref().to_string())
+            .map(|name| name.as_ref().into())
             .collect();
         self.drop_columns_impl(columns)
     }
 
     #[allow(clippy::ptr_arg)]
-    fn drop_columns_impl(self, columns: Vec<String>) -> Self {
+    fn drop_columns_impl(self, columns: Vec<SmartString>) -> Self {
         if let Some(lp) = self.check_names(&columns, None) {
             lp
         } else {
@@ -544,13 +575,13 @@ impl LazyFrame {
             },
         };
         let (mut state, mut physical_plan, is_streaming) = self.prepare_collect(true)?;
-
-        if is_streaming {
-            let _ = physical_plan.execute(&mut state)?;
-            Ok(())
-        } else {
-            Err(PolarsError::ComputeError("Cannot run whole the query in a streaming order. Use `collect().write_parquet()` instead.".into()))
-        }
+        polars_ensure!(
+            is_streaming,
+            ComputeError: "cannot run the whole query in a streaming order; \
+            use `collect().write_parquet()` instead"
+        );
+        let _ = physical_plan.execute(&mut state)?;
+        Ok(())
     }
 
     //// Stream a query result into an ipc/arrow file. This is useful if the final result doesn't fit
@@ -567,13 +598,13 @@ impl LazyFrame {
             },
         };
         let (mut state, mut physical_plan, is_streaming) = self.prepare_collect(true)?;
-
-        if is_streaming {
-            let _ = physical_plan.execute(&mut state)?;
-            Ok(())
-        } else {
-            Err(PolarsError::ComputeError("Cannot run whole the query in a streaming order. Use `collect().write_parquet()` instead.".into()))
-        }
+        polars_ensure!(
+            is_streaming,
+            ComputeError: "cannot run the whole query in a streaming order; \
+            use `collect().write_ipc()` instead"
+        );
+        let _ = physical_plan.execute(&mut state)?;
+        Ok(())
     }
 
     /// Filter by some predicate expression.
@@ -986,6 +1017,7 @@ impl LazyFrame {
             subset: subset.map(Arc::new),
             maintain_order: true,
             keep_strategy,
+            ..Default::default()
         };
         let lp = self.get_plan_builder().distinct(options).build();
         Self::from_logical_plan(lp, opt_state)
@@ -1002,6 +1034,7 @@ impl LazyFrame {
             subset: subset.map(Arc::new),
             maintain_order: false,
             keep_strategy,
+            ..Default::default()
         };
         let lp = self.get_plan_builder().distinct(options).build();
         Self::from_logical_plan(lp, opt_state)
@@ -1012,10 +1045,14 @@ impl LazyFrame {
     /// Equal to `LazyFrame::filter(col("*").is_not_null())`
     pub fn drop_nulls(self, subset: Option<Vec<Expr>>) -> LazyFrame {
         match subset {
-            None => self.filter(col("*").is_not_null()),
+            None => self.filter(all_exprs([col("*").is_not_null()])),
             Some(subset) => {
-                let it = subset.into_iter().map(|e| e.is_not_null());
-                let predicate = combine_predicates_expr(it);
+                let predicate = all_exprs(
+                    subset
+                        .into_iter()
+                        .map(|e| e.is_not_null())
+                        .collect::<Vec<_>>(),
+                );
                 self.filter(predicate)
             }
         }
@@ -1099,8 +1136,7 @@ impl LazyFrame {
     /// This can have a negative effect on query performance.
     /// This may for instance block predicate pushdown optimization.
     pub fn with_row_count(mut self, name: &str, offset: Option<IdxSize>) -> LazyFrame {
-        let mut add_row_count_in_map = false;
-        match &mut self.logical_plan {
+        let add_row_count_in_map = match &mut self.logical_plan {
             // Do the row count at scan
             #[cfg(feature = "csv-file")]
             LogicalPlan::CsvScan { options, .. } => {
@@ -1108,6 +1144,7 @@ impl LazyFrame {
                     name: name.to_string(),
                     offset: offset.unwrap_or(0),
                 });
+                false
             }
             #[cfg(feature = "ipc")]
             LogicalPlan::IpcScan { options, .. } => {
@@ -1115,6 +1152,7 @@ impl LazyFrame {
                     name: name.to_string(),
                     offset: offset.unwrap_or(0),
                 });
+                false
             }
             #[cfg(feature = "parquet")]
             LogicalPlan::ParquetScan { options, .. } => {
@@ -1122,13 +1160,12 @@ impl LazyFrame {
                     name: name.to_string(),
                     offset: offset.unwrap_or(0),
                 });
+                false
             }
-            _ => {
-                add_row_count_in_map = true;
-            }
-        }
+            _ => true,
+        };
 
-        let name2 = name.to_string();
+        let name2: SmartString = name.into();
         let udf_schema = move |s: &Schema| {
             let new = s.insert_index(0, name2.clone(), IDX_DTYPE).unwrap();
             Ok(Arc::new(new))
@@ -1167,7 +1204,7 @@ impl LazyFrame {
     #[cfg(feature = "dtype-struct")]
     pub fn unnest<I: IntoIterator<Item = S>, S: AsRef<str>>(self, cols: I) -> Self {
         self.map_private(FunctionNode::Unnest {
-            columns: Arc::new(cols.into_iter().map(|s| Arc::from(s.as_ref())).collect()),
+            columns: cols.into_iter().map(|s| Arc::from(s.as_ref())).collect(),
         })
     }
 

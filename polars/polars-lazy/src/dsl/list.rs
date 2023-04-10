@@ -40,14 +40,16 @@ pub trait ListNameSpaceExtension: IntoListNameSpace + Sized {
                         data_type: DataType::Categorical(_),
                         ..
                     } => {
-                        return Err(PolarsError::ComputeError(
-                            "Casting to 'Categorical' not allowed in 'arr.eval'".into(),
-                        ))
+                        polars_bail!(
+                            ComputeError: "casting to categorical not allowed in `arr.eval`"
+                        )
                     }
                     Expr::Column(name) => {
-                        if !name.is_empty() {
-                            return Err(PolarsError::ComputeError(r#"Named columns not allowed in 'arr.eval'. Consider using 'element' or 'col("")'."#.into()));
-                        }
+                        polars_ensure!(
+                            name.is_empty(),
+                            ComputeError:
+                            "named columns are not allowed in `arr.eval`; consider using `element` or `col(\"\")`"
+                        );
                     }
                     _ => {}
                 }
@@ -94,7 +96,7 @@ pub trait ListNameSpaceExtension: IntoListNameSpace + Sized {
 
                 lst.into_iter()
                     .map(|s| {
-                        s.and_then(|s| {
+                        s.and_then(|s| unsafe {
                             df_container.get_columns_mut().push(s);
                             let out = phys_expr.evaluate(&df_container, &state);
                             df_container.get_columns_mut().clear();

@@ -36,6 +36,7 @@ def test_scan_ndjson(foods_ndjson_path: Path) -> None:
     assert df["foo"].to_list() == [10, 16, 21, 23, 24, 30, 35]
 
 
+@pytest.mark.write_disk()
 def test_scan_with_projection() -> None:
     json = r"""
 {"text": "\"hello", "id": 1}
@@ -74,3 +75,19 @@ def test_scan_with_projection() -> None:
         }
     )
     assert_frame_equal(actual, expected)
+
+
+def test_glob_n_rows(io_files_path: Path) -> None:
+    file_path = io_files_path / "foods*.ndjson"
+    df = pl.scan_ndjson(file_path, n_rows=40).collect()
+
+    # 27 rows from foods1.ndjson and 13 from foods2.ndjson
+    assert df.shape == (40, 4)
+
+    # take first and last rows
+    assert df[[0, 39]].to_dict(False) == {
+        "category": ["vegetables", "seafood"],
+        "calories": [45, 146],
+        "fats_g": [0.5, 6.0],
+        "sugars_g": [2, 2],
+    }

@@ -1,39 +1,47 @@
 mod arg_sort;
-#[cfg(feature = "sort_multiple")]
-mod arg_sort_multiple;
+
+pub mod arg_sort_multiple;
 #[cfg(feature = "dtype-categorical")]
 mod categorical;
+mod slice;
 
 use std::cmp::Ordering;
 use std::hint::unreachable_unchecked;
 use std::iter::FromIterator;
 
+pub(crate) use arg_sort_multiple::argsort_multiple_row_fmt;
 use arrow::bitmap::MutableBitmap;
 use arrow::buffer::Buffer;
-use num::Float;
+use num_traits::Float;
 use polars_arrow::array::default_arrays::FromDataUtf8;
 use polars_arrow::kernels::rolling::compare_fn_nan_max;
 use polars_arrow::prelude::{FromData, ValueSize};
 use polars_arrow::trusted_len::PushUnchecked;
 use rayon::prelude::*;
+pub use slice::*;
 
 use crate::prelude::compare_inner::PartialOrdInner;
-#[cfg(feature = "sort_multiple")]
+#[cfg(feature = "dtype-struct")]
+use crate::prelude::sort::arg_sort_multiple::_get_rows_encoded_ca;
 use crate::prelude::sort::arg_sort_multiple::{arg_sort_multiple_impl, args_validate};
 use crate::prelude::*;
 use crate::series::IsSorted;
 use crate::utils::{CustomIterTools, NoNull};
+use crate::POOL;
 
 /// Reverse sorting when there are no nulls
+#[inline]
 fn order_descending<T: Ord>(a: &T, b: &T) -> Ordering {
     b.cmp(a)
 }
 
 /// Default sorting when there are no nulls
+#[inline]
 fn order_ascending<T: Ord>(a: &T, b: &T) -> Ordering {
     a.cmp(b)
 }
 
+#[inline]
 fn order_ascending_flt<T: Float>(a: &T, b: &T) -> Ordering {
     a.partial_cmp(b).unwrap_or_else(|| {
         match (a.is_nan(), b.is_nan()) {
@@ -46,10 +54,12 @@ fn order_ascending_flt<T: Float>(a: &T, b: &T) -> Ordering {
     })
 }
 
+#[inline]
 fn order_descending_flt<T: Float>(a: &T, b: &T) -> Ordering {
     order_ascending_flt(b, a)
 }
 
+#[inline]
 fn sort_branch<T, Fd, Fr>(
     slice: &mut [T],
     descending: bool,
@@ -58,14 +68,14 @@ fn sort_branch<T, Fd, Fr>(
     parallel: bool,
 ) where
     T: PartialOrd + Send,
-    Fd: FnMut(&T, &T) -> Ordering + for<'r, 's> Fn(&'r T, &'s T) -> Ordering + Sync,
-    Fr: FnMut(&T, &T) -> Ordering + for<'r, 's> Fn(&'r T, &'s T) -> Ordering + Sync,
+    Fd: FnMut(&T, &T) -> Ordering + for<'r, 's> Fn(&'r T, &'s T) -> Ordering + Sync + Send,
+    Fr: FnMut(&T, &T) -> Ordering + for<'r, 's> Fn(&'r T, &'s T) -> Ordering + Sync + Send,
 {
     if parallel {
-        match descending {
+        POOL.install(|| match descending {
             true => slice.par_sort_unstable_by(descending_order_fn),
             false => slice.par_sort_unstable_by(ascending_order_fn),
-        }
+        })
     } else {
         match descending {
             true => slice.sort_unstable_by(descending_order_fn),
@@ -89,7 +99,7 @@ where
     );
 }
 
-pub fn arg_sort_branch<T, Fd, Fr>(
+pub(crate) fn arg_sort_branch<T, Fd, Fr>(
     slice: &mut [T],
     descending: bool,
     ascending_order_fn: Fd,
@@ -97,34 +107,20 @@ pub fn arg_sort_branch<T, Fd, Fr>(
     parallel: bool,
 ) where
     T: PartialOrd + Send,
-    Fd: FnMut(&T, &T) -> Ordering + for<'r, 's> Fn(&'r T, &'s T) -> Ordering + Sync,
-    Fr: FnMut(&T, &T) -> Ordering + for<'r, 's> Fn(&'r T, &'s T) -> Ordering + Sync,
+    Fd: FnMut(&T, &T) -> Ordering + for<'r, 's> Fn(&'r T, &'s T) -> Ordering + Sync + Send,
+    Fr: FnMut(&T, &T) -> Ordering + for<'r, 's> Fn(&'r T, &'s T) -> Ordering + Sync + Send,
 {
     if parallel {
-        match descending {
+        POOL.install(|| match descending {
             true => slice.par_sort_by(descending_order_fn),
             false => slice.par_sort_by(ascending_order_fn),
-        }
+        })
     } else {
         match descending {
             true => slice.sort_by(descending_order_fn),
             false => slice.sort_by(ascending_order_fn),
         }
     }
-}
-
-fn memcpy_values<T>(ca: &ChunkedArray<T>) -> Vec<T::Native>
-where
-    T: PolarsNumericType,
-{
-    let len = ca.len();
-    let mut vals = Vec::with_capacity(len);
-
-    ca.downcast_iter().for_each(|arr| {
-        let values = arr.values().as_slice();
-        vals.extend_from_slice(values);
-    });
-    vals
 }
 
 macro_rules! sort_with_fast_path {
@@ -171,7 +167,7 @@ where
 {
     sort_with_fast_path!(ca, options);
     if ca.null_count() == 0 {
-        let mut vals = memcpy_values(ca);
+        let mut vals = ca.to_vec_null_aware().left().unwrap();
 
         sort_branch(
             vals.as_mut_slice(),
@@ -291,7 +287,6 @@ where
     }
 }
 
-#[cfg(feature = "sort_multiple")]
 fn arg_sort_multiple_numeric<T: PolarsNumericType>(
     ca: &ChunkedArray<T>,
     other: &[Series],
@@ -331,7 +326,6 @@ where
         arg_sort_numeric(self, options)
     }
 
-    #[cfg(feature = "sort_multiple")]
     /// # Panics
     ///
     /// This function is very opinionated.
@@ -357,7 +351,6 @@ impl ChunkSort<Float32Type> for Float32Chunked {
         arg_sort_numeric(self, options)
     }
 
-    #[cfg(feature = "sort_multiple")]
     /// # Panics
     ///
     /// This function is very opinionated.
@@ -383,7 +376,6 @@ impl ChunkSort<Float64Type> for Float64Chunked {
         arg_sort_numeric(self, options)
     }
 
-    #[cfg(feature = "sort_multiple")]
     /// # Panics
     ///
     /// This function is very opinionated.
@@ -516,16 +508,9 @@ impl ChunkSort<Utf8Type> for Utf8Chunked {
     }
 
     fn arg_sort(&self, options: SortOptions) -> IdxCa {
-        arg_sort::arg_sort(
-            self.name(),
-            self.downcast_iter().map(|arr| arr.iter()),
-            options,
-            self.null_count(),
-            self.len(),
-        )
+        self.as_binary().arg_sort(options)
     }
 
-    #[cfg(feature = "sort_multiple")]
     /// # Panics
     ///
     /// This function is very opinionated. On the implementation of `ChunkedArray<T>` for numeric types,
@@ -535,22 +520,10 @@ impl ChunkSort<Utf8Type> for Utf8Chunked {
     /// uphold this contract. If not, it will panic.
     ///
     fn arg_sort_multiple(&self, other: &[Series], descending: &[bool]) -> PolarsResult<IdxCa> {
-        args_validate(self, other, descending)?;
-
-        let mut count: IdxSize = 0;
-        let vals: Vec<_> = self
-            .into_iter()
-            .map(|v| {
-                let i = count;
-                count += 1;
-                (i, v)
-            })
-            .collect_trusted();
-        arg_sort_multiple_impl(vals, other, descending)
+        self.as_binary().arg_sort_multiple(other, descending)
     }
 }
 
-#[cfg(feature = "dtype-binary")]
 impl ChunkSort<BinaryType> for BinaryChunked {
     fn sort_with(&self, options: SortOptions) -> ChunkedArray<BinaryType> {
         sort_with_fast_path!(self, options);
@@ -663,7 +636,6 @@ impl ChunkSort<BinaryType> for BinaryChunked {
         )
     }
 
-    #[cfg(feature = "sort_multiple")]
     /// # Panics
     ///
     /// This function is very opinionated. On the implementation of `ChunkedArray<T>` for numeric types,
@@ -688,6 +660,20 @@ impl ChunkSort<BinaryType> for BinaryChunked {
     }
 }
 
+#[cfg(feature = "dtype-struct")]
+impl StructChunked {
+    pub(crate) fn arg_sort(&self, options: SortOptions) -> IdxCa {
+        let bin = _get_rows_encoded_ca(
+            self.name(),
+            &[self.clone().into_series()],
+            &[options.descending],
+            options.nulls_last,
+        )
+        .unwrap();
+        bin.arg_sort(Default::default())
+    }
+}
+
 impl ChunkSort<BooleanType> for BooleanChunked {
     fn sort_with(&self, options: SortOptions) -> ChunkedArray<BooleanType> {
         sort_with_fast_path!(self, options);
@@ -695,6 +681,22 @@ impl ChunkSort<BooleanType> for BooleanChunked {
             !options.nulls_last,
             "null last not yet supported for bool dtype"
         );
+        if self.null_count() == 0 {
+            let len = self.len();
+            let n_set = self.sum().unwrap() as usize;
+            let mut bitmap = MutableBitmap::with_capacity(len);
+            let (first, second) = if options.descending {
+                (true, false)
+            } else {
+                (false, true)
+            };
+            bitmap.extend_constant(len - n_set, first);
+            bitmap.extend_constant(n_set, second);
+            let arr = BooleanArray::from_data_default(bitmap.into(), None);
+
+            return unsafe { self.with_chunks(vec![Box::new(arr) as ArrayRef]) };
+        }
+
         let mut vals = self.into_iter().collect::<Vec<_>>();
 
         if options.descending {
@@ -727,7 +729,53 @@ impl ChunkSort<BooleanType> for BooleanChunked {
     }
 }
 
-#[cfg(feature = "sort_multiple")]
+pub(crate) fn convert_sort_column_multi_sort(
+    s: &Series,
+    row_ordering: bool,
+) -> PolarsResult<Series> {
+    use DataType::*;
+    let out = match s.dtype() {
+        #[cfg(feature = "dtype-categorical")]
+        Categorical(_) => s.rechunk(),
+        Binary => s.clone(),
+        Utf8 => s.cast(&Binary).unwrap(),
+        Boolean => {
+            if row_ordering {
+                s.clone()
+            } else {
+                s.cast(&UInt8).unwrap()
+            }
+        }
+        #[cfg(feature = "dtype-struct")]
+        Struct(_) => {
+            let ca = s.struct_().unwrap();
+            let new_fields = ca
+                .fields()
+                .iter()
+                .map(|s| convert_sort_column_multi_sort(s, row_ordering))
+                .collect::<PolarsResult<Vec<_>>>()?;
+            return StructChunked::new(ca.name(), &new_fields).map(|ca| ca.into_series());
+        }
+        _ => {
+            let phys = s.to_physical_repr().into_owned();
+            polars_ensure!(
+                phys.dtype().is_numeric(),
+                ComputeError: "cannot sort column of dtype `{}`", s.dtype()
+            );
+            phys
+        }
+    };
+    Ok(out)
+}
+
+pub fn _broadcast_descending(n_cols: usize, descending: &mut Vec<bool>) {
+    if n_cols > descending.len() && descending.len() == 1 {
+        while n_cols != descending.len() {
+            descending.push(descending[0]);
+        }
+    }
+}
+
 pub(crate) fn prepare_arg_sort(
     columns: Vec<Series>,
     mut descending: Vec<bool>,
@@ -736,33 +784,13 @@ pub(crate) fn prepare_arg_sort(
 
     let mut columns = columns
         .iter()
-        .map(|s| {
-            use DataType::*;
-            match s.dtype() {
-                Float32 | Float64 | Int32 | Int64 | Utf8 | UInt32 | UInt64 => s.clone(),
-                #[cfg(feature = "dtype-categorical")]
-                Categorical(_) => s.rechunk(),
-                _ => {
-                    // small integers i8, u8 etc are casted to reduce compiler bloat
-                    // not that we don't expect any logical types at this point
-                    if s.bit_repr_is_large() {
-                        s.cast(&DataType::Int64).unwrap()
-                    } else {
-                        s.cast(&DataType::Int32).unwrap()
-                    }
-                }
-            }
-        })
-        .collect::<Vec<_>>();
+        .map(|s| convert_sort_column_multi_sort(s, false))
+        .collect::<PolarsResult<Vec<_>>>()?;
 
     let first = columns.remove(0);
 
     // broadcast ordering
-    if n_cols > descending.len() && descending.len() == 1 {
-        while n_cols != descending.len() {
-            descending.push(descending[0]);
-        }
-    }
+    _broadcast_descending(n_cols, &mut descending);
     Ok((first, columns, descending))
 }
 
@@ -858,7 +886,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "sort_multiple")]
     #[cfg_attr(miri, ignore)]
     fn test_arg_sort_multiple() -> PolarsResult<()> {
         let a = Int32Chunked::new("a", &[1, 2, 1, 1, 3, 4, 3, 3]);
@@ -866,7 +893,7 @@ mod test {
         let c = Utf8Chunked::new("c", &["a", "b", "c", "d", "e", "f", "g", "h"]);
         let df = DataFrame::new(vec![a.into_series(), b.into_series(), c.into_series()])?;
 
-        let out = df.sort(&["a", "b", "c"], false)?;
+        let out = df.sort(["a", "b", "c"], false)?;
         assert_eq!(
             Vec::from(out.column("b")?.i64()?),
             &[
@@ -886,7 +913,7 @@ mod test {
         let b = Int32Chunked::new("b", &[5, 4, 2, 3, 4, 5]).into_series();
         let df = DataFrame::new(vec![a, b])?;
 
-        let out = df.sort(&["a", "b"], false)?;
+        let out = df.sort(["a", "b"], false)?;
         let expected = df!(
             "a" => ["a", "a", "b", "b", "c", "c"],
             "b" => [3, 5, 4, 4, 2, 5]
@@ -898,14 +925,14 @@ mod test {
             "values" => ["a", "a", "b"]
         )?;
 
-        let out = df.sort(&["groups", "values"], vec![true, false])?;
+        let out = df.sort(["groups", "values"], vec![true, false])?;
         let expected = df!(
             "groups" => [3, 2, 1],
             "values" => ["b", "a", "a"]
         )?;
         assert!(out.frame_equal(&expected));
 
-        let out = df.sort(&["values", "groups"], vec![false, true])?;
+        let out = df.sort(["values", "groups"], vec![false, true])?;
         let expected = df!(
             "groups" => [2, 1, 3],
             "values" => ["a", "a", "b"]

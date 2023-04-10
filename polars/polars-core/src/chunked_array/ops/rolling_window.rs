@@ -28,7 +28,8 @@ mod inner_mod {
 
     use arrow::array::{Array, PrimitiveArray};
     use arrow::bitmap::MutableBitmap;
-    use num::{Float, Zero};
+    use num_traits::pow::Pow;
+    use num_traits::{Float, Zero};
     use polars_arrow::bit_util::unset_bit_raw;
     use polars_arrow::data_types::IsFloat;
     use polars_arrow::trusted_len::PushUnchecked;
@@ -37,13 +38,12 @@ mod inner_mod {
 
     /// utility
     fn check_input(window_size: usize, min_periods: usize) -> PolarsResult<()> {
-        if min_periods > window_size {
-            Err(PolarsError::ComputeError(
-                "`windows_size` should be >= `min_periods`".into(),
-            ))
-        } else {
-            Ok(())
-        }
+        polars_ensure!(
+            min_periods <= window_size,
+            ComputeError: "`window_size`: {} should be >= `min_periods`: {}",
+            window_size, min_periods
+        );
+        Ok(())
     }
 
     /// utility
@@ -52,7 +52,7 @@ mod inner_mod {
             let right_window = (window_size + 1) / 2;
             (
                 idx.saturating_sub(window_size - right_window),
-                std::cmp::min(len, idx + right_window),
+                len.min(idx + right_window),
             )
         } else {
             (idx.saturating_sub(window_size - 1), idx + 1)
@@ -182,7 +182,7 @@ mod inner_mod {
     where
         ChunkedArray<T>: IntoSeries,
         T: PolarsFloatType,
-        T::Native: Float + IsFloat + SubAssign + num::pow::Pow<T::Native, Output = T::Native>,
+        T::Native: Float + IsFloat + SubAssign + Pow<T::Native, Output = T::Native>,
     {
         /// Apply a rolling custom function. This is pretty slow because of dynamic dispatch.
         pub fn rolling_apply_float<F>(&self, window_size: usize, mut f: F) -> PolarsResult<Self>

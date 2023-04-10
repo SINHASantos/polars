@@ -1,21 +1,29 @@
 from __future__ import annotations
 
+import re
+from itertools import zip_longest
 from typing import TYPE_CHECKING, Any, Mapping, Sequence, overload
 
-from polars.datatypes import N_INFER_DEFAULT, SchemaDefinition, SchemaDict
+from polars import internals as pli
+from polars.datatypes import (
+    N_INFER_DEFAULT,
+    List,
+    Object,
+    Struct,
+)
 from polars.dependencies import _PYARROW_AVAILABLE
-from polars.dependencies import numpy as np
 from polars.dependencies import pandas as pd
 from polars.dependencies import pyarrow as pa
 from polars.exceptions import NoDataError
-from polars.internals import DataFrame, Series
-from polars.utils import deprecate_nonkeyword_arguments, deprecated_alias
+from polars.utils.various import _cast_repr_strings_with_schema, parse_version
 
 if TYPE_CHECKING:
-    from polars.internals.type_aliases import Orientation
+    from polars.dataframe import DataFrame
+    from polars.dependencies import numpy as np
+    from polars.series import Series
+    from polars.type_aliases import Orientation, SchemaDefinition, SchemaDict
 
 
-@deprecated_alias(columns="schema")
 def from_dict(
     data: Mapping[str, Sequence[object] | Mapping[str, Sequence[object]] | Series],
     schema: SchemaDefinition | None = None,
@@ -65,29 +73,25 @@ def from_dict(
     └─────┴─────┘
 
     """
-    return DataFrame._from_dict(
-        data=data, schema=schema, schema_overrides=schema_overrides
+    return pli.DataFrame._from_dict(
+        data, schema=schema, schema_overrides=schema_overrides
     )
 
 
-@deprecate_nonkeyword_arguments(allowed_args=["dicts"])
 def from_dicts(
-    dicts: Sequence[dict[str, Any]],
-    infer_schema_length: int | None = N_INFER_DEFAULT,
-    *,
+    data: Sequence[dict[str, Any]],
     schema: SchemaDefinition | None = None,
+    *,
     schema_overrides: SchemaDict | None = None,
+    infer_schema_length: int | None = N_INFER_DEFAULT,
 ) -> DataFrame:
     """
     Construct a DataFrame from a sequence of dictionaries. This operation clones data.
 
     Parameters
     ----------
-    dicts
+    data
         Sequence with dictionaries mapping column name to value
-    infer_schema_length
-        How many dictionaries/rows to scan to determine the data types
-        if set to `None` then ALL dicts are scanned; this will be slow.
     schema : Sequence of str, (str,DataType) pairs, or a {str:DataType,} dict
         The DataFrame schema may be declared in several ways:
 
@@ -106,6 +110,9 @@ def from_dicts(
         them to the schema.
     schema_overrides : dict, default None
         Support override of inferred types for one or more columns.
+    infer_schema_length
+        How many dictionaries/rows to scan to determine the data types
+        if set to `None` then ALL dicts are scanned; this will be slow.
 
     Returns
     -------
@@ -162,18 +169,17 @@ def from_dicts(
     └─────┴─────┴──────┴──────┘
 
     """
-    if not dicts and not (schema or schema_overrides):
+    if not data and not (schema or schema_overrides):
         raise NoDataError("No rows. Cannot infer schema.")
 
-    return DataFrame(
-        data=dicts,
+    return pli.DataFrame(
+        data,
         schema=schema,
         schema_overrides=schema_overrides,
         infer_schema_length=infer_schema_length,
     )
 
 
-@deprecated_alias(columns="schema")
 def from_records(
     data: Sequence[Sequence[Any]],
     schema: SchemaDefinition | None = None,
@@ -233,7 +239,7 @@ def from_records(
     └─────┴─────┘
 
     """
-    return DataFrame._from_records(
+    return pli.DataFrame._from_records(
         data,
         schema=schema,
         schema_overrides=schema_overrides,
@@ -242,7 +248,120 @@ def from_records(
     )
 
 
-@deprecated_alias(columns="schema")
+def from_repr(tbl: str) -> DataFrame:
+    """
+    Debug function that reconstructs a DataFrame from a table repr.
+
+    Parameters
+    ----------
+    tbl
+        A string containing a polars table repr; does not need to be trimmed
+        of whitespace (or leading prompts) as the table will be found/extracted
+        automatically.
+
+    Notes
+    -----
+    This function handles the default UTF8_FULL and UTF8_FULL_CONDENSED format
+    tables (with or without rounded corners). Truncated columns/rows are omitted,
+    wrapped headers are accounted for, and dtypes identified.
+
+    Currently compound types such as List and Struct are not supported,
+    (and neither is Time) though support is planned.
+
+    See Also
+    --------
+    polars.DataFrame.to_init_repr
+    polars.Series.to_init_repr
+
+    Examples
+    --------
+    >>> df = pl.from_repr(
+    ...     '''
+    ...     Out[3]:
+    ...     shape: (1, 5)
+    ...     ┌───────────┬────────────┬───┬───────┬────────────────────────────────┐
+    ...     │ source_ac ┆ source_cha ┆ … ┆ ident ┆ timestamp                      │
+    ...     │ tor_id    ┆ nnel_id    ┆   ┆ ---   ┆ ---                            │
+    ...     │ ---       ┆ ---        ┆   ┆ str   ┆ datetime[μs, Asia/Tokyo]       │
+    ...     │ i32       ┆ i64        ┆   ┆       ┆                                │
+    ...     ╞═══════════╪════════════╪═══╪═══════╪════════════════════════════════╡
+    ...     │ 123456780 ┆ 9876543210 ┆ … ┆ a:b:c ┆ 2023-03-25 10:56:59.663053 JST │
+    ...     │ …         ┆ …          ┆ … ┆ …     ┆ …                              │
+    ...     │ 803065983 ┆ 2055938745 ┆ … ┆ x:y:z ┆ 2023-03-25 12:38:18.050545 JST │
+    ...     └───────────┴────────────┴───┴───────┴────────────────────────────────┘
+    ... '''
+    ... )
+    >>> df
+    shape: (2, 4)
+    ┌─────────────────┬───────────────────┬───────┬────────────────────────────────┐
+    │ source_actor_id ┆ source_channel_id ┆ ident ┆ timestamp                      │
+    │ ---             ┆ ---               ┆ ---   ┆ ---                            │
+    │ i32             ┆ i64               ┆ str   ┆ datetime[μs, Asia/Tokyo]       │
+    ╞═════════════════╪═══════════════════╪═══════╪════════════════════════════════╡
+    │ 123456780       ┆ 9876543210        ┆ a:b:c ┆ 2023-03-25 10:56:59.663053 JST │
+    │ 803065983       ┆ 2055938745        ┆ x:y:z ┆ 2023-03-25 12:38:18.050545 JST │
+    └─────────────────┴───────────────────┴───────┴────────────────────────────────┘
+    >>> df.schema
+    {'source_actor_id': Int32,
+     'source_channel_id': Int64,
+     'ident': Utf8,
+     'timestamp': Datetime(time_unit='us', time_zone='Asia/Tokyo')}
+
+    """
+    from polars.datatypes.convert import dtype_short_repr_to_dtype
+
+    # pick dataframe table out of the given string
+    m = re.search(r"([┌╭].*?[┘╯])", tbl, re.DOTALL)
+    if m is None:
+        raise ValueError("Table not found in the given string")
+
+    # extract elements from table structure
+    lines = m.group().split("\n")[1:-1]
+    rows = [
+        [re.sub(r"^[\W+]*│", "", elem).strip() for elem in row]
+        for row in [re.split("[┆|]", row.rstrip("│ ")) for row in lines]
+        if len(row) > 1 or not re.search("├[╌┼]+┤", row[0])
+    ]
+
+    # determine beginning/end of the header block
+    table_body_start = 2
+    for idx, (elem, *_) in enumerate(rows):
+        if re.match(r"^\W*╞", elem):
+            table_body_start = idx
+            break
+
+    # handle headers with wrapped column names and determine headers/dtypes
+    header_block = ["".join(h).split("---") for h in zip(*rows[:table_body_start])]
+    headers, dtypes = (list(h) for h in zip_longest(*header_block))
+    body = rows[table_body_start + 1 :]
+
+    # transpose rows into columns, detect/omit truncated columns
+    coldata = list(zip(*(row for row in body if not all((e == "…") for e in row))))
+    for el in ("…", "..."):
+        if el in headers:
+            idx = headers.index(el)
+            for table_elem in (headers, dtypes):
+                table_elem.pop(idx)
+            if coldata:
+                coldata.pop(idx)
+
+    # init cols as utf8 Series, handle "null" -> None, create schema from repr dtype
+    data = [pli.Series([(None if v == "null" else v) for v in cd]) for cd in coldata]
+    schema = dict(zip(headers, (dtype_short_repr_to_dtype(d) for d in dtypes)))
+    for tp in set(schema.values()):
+        # TODO: handle basic compound types
+        if tp in (List, Struct):
+            raise NotImplementedError(
+                f"'from_repr' does not (yet) support {tp} dtype columns"
+            )
+        elif tp == Object:
+            raise ValueError("'from_repr' does not (and cannot) support Object dtype")
+
+    # construct DataFrame from string series and cast from repr to native dtype
+    df = pli.DataFrame(data=data, orient="col", schema=list(schema))
+    return _cast_repr_strings_with_schema(df, schema)
+
+
 def from_numpy(
     data: np.ndarray[Any, Any],
     schema: SchemaDefinition | None = None,
@@ -299,17 +418,28 @@ def from_numpy(
     └─────┴─────┘
 
     """
-    return DataFrame._from_numpy(
+    return pli.DataFrame._from_numpy(
         data, schema=schema, orient=orient, schema_overrides=schema_overrides
     )
 
 
-@deprecate_nonkeyword_arguments()
+# Note: we cannot @overload the typing (Series vs DataFrame) here, as pyarrow
+# does not implement any support for type hints; attempts to hint here will
+# simply result in mypy inferring "Any", which isn't useful...
+
+
 def from_arrow(
-    a: pa.Table | pa.Array | pa.ChunkedArray,
-    rechunk: bool = True,
-    schema: Sequence[str] | None = None,
+    data: (
+        pa.Table
+        | pa.Array
+        | pa.ChunkedArray
+        | pa.RecordBatch
+        | Sequence[pa.RecordBatch]
+    ),
+    schema: SchemaDefinition | None = None,
+    *,
     schema_overrides: SchemaDict | None = None,
+    rechunk: bool = True,
 ) -> DataFrame | Series:
     """
     Create a DataFrame or Series from an Arrow Table or Array.
@@ -319,14 +449,8 @@ def from_arrow(
 
     Parameters
     ----------
-    a : :class:`pyarrow.Table` or :class:`pyarrow.Array`
-        Data representing an Arrow Table or Array.
-    rechunk : bool, default True
-        Make sure that all data is in contiguous memory.
-    schema : Sequence of str, dict, default None
-        Column labels to use for resulting DataFrame. Must match data dimensions.
-        If not specified, existing Array table columns are used, with missing names
-        named as `column_0`, `column_1`, etc.
+    data : :class:`pyarrow.Table`, :class:`pyarrow.Array`, one or more :class:`pyarrow.RecordBatch`
+        Data representing an Arrow Table, Array, or sequence of RecordBatches.
     schema : Sequence of str, (str,DataType) pairs, or a {str:DataType,} dict
         The DataFrame schema may be declared in several ways:
 
@@ -340,6 +464,8 @@ def from_arrow(
     schema_overrides : dict, default None
         Support type specification or override of one or more columns; note that
         any dtypes inferred from the schema param will be overridden.
+    rechunk : bool, default True
+        Make sure that all data is in contiguous memory.
 
     Returns
     -------
@@ -368,59 +494,79 @@ def from_arrow(
 
     >>> import pyarrow as pa
     >>> data = pa.array([1, 2, 3])
-    >>> series = pl.from_arrow(data)
+    >>> series = pl.from_arrow(data, schema={"s": pl.Int32})
     >>> series
     shape: (3,)
-    Series: '' [i64]
+    Series: 's' [i32]
     [
         1
         2
         3
     ]
 
-    """
-    if isinstance(a, pa.Table):
-        return DataFrame._from_arrow(
-            a, rechunk=rechunk, schema=schema, schema_overrides=schema_overrides
+    """  # noqa: W505
+    if isinstance(data, pa.Table):
+        return pli.DataFrame._from_arrow(
+            data=data, rechunk=rechunk, schema=schema, schema_overrides=schema_overrides
         )
-    elif isinstance(a, (pa.Array, pa.ChunkedArray)):
-        return Series._from_arrow("", a, rechunk)
+    elif isinstance(data, (pa.Array, pa.ChunkedArray)):
+        name = getattr(data, "_name", "") or ""
+        s = pli.DataFrame(
+            data=pli.Series._from_arrow(name, data, rechunk=rechunk),
+            schema=schema,
+            schema_overrides=schema_overrides,
+        ).to_series()
+        return (
+            s if (name or schema or schema_overrides) else s.rename("", in_place=True)
+        )
+
+    if isinstance(data, pa.RecordBatch):
+        data = [data]
+    if isinstance(data, Sequence) and data and isinstance(data[0], pa.RecordBatch):
+        return pli.DataFrame._from_arrow(
+            data=pa.Table.from_batches(data),
+            rechunk=rechunk,
+            schema=schema,
+            schema_overrides=schema_overrides,
+        )
+    elif isinstance(data, Sequence) and (schema or schema_overrides) and not data:
+        return pli.DataFrame(data=[], schema=schema, schema_overrides=schema_overrides)
     else:
-        raise ValueError(f"Expected Arrow Table or Array, got {type(a)}.")
+        raise ValueError(
+            f"expected pyarrow Table, Array, or sequence of RecordBatches; got {type(data)}."
+        )
 
 
 @overload
 def from_pandas(
-    df: pd.DataFrame,
-    rechunk: bool = True,
-    nan_to_null: bool = True,
-    schema_overrides: SchemaDict | None = None,
+    data: pd.DataFrame,
     *,
-    include_index: bool = False,
+    schema_overrides: SchemaDict | None = ...,
+    rechunk: bool = ...,
+    nan_to_null: bool = ...,
+    include_index: bool = ...,
 ) -> DataFrame:
     ...
 
 
 @overload
 def from_pandas(
-    df: pd.Series | pd.DatetimeIndex,
-    rechunk: bool = True,
-    nan_to_null: bool = True,
-    schema_overrides: SchemaDict | None = None,
+    data: pd.Series | pd.DatetimeIndex,
     *,
-    include_index: bool = False,
+    schema_overrides: SchemaDict | None = ...,
+    rechunk: bool = ...,
+    nan_to_null: bool = ...,
+    include_index: bool = ...,
 ) -> Series:
     ...
 
 
-@deprecate_nonkeyword_arguments()
-@deprecated_alias(nan_to_none="nan_to_null")
 def from_pandas(
-    df: pd.DataFrame | pd.Series | pd.DatetimeIndex,
+    data: pd.DataFrame | pd.Series | pd.DatetimeIndex,
+    *,
+    schema_overrides: SchemaDict | None = None,
     rechunk: bool = True,
     nan_to_null: bool = True,
-    schema_overrides: SchemaDict | None = None,
-    *,
     include_index: bool = False,
 ) -> DataFrame | Series:
     """
@@ -432,14 +578,14 @@ def from_pandas(
 
     Parameters
     ----------
-    df: :class:`pandas.DataFrame`, :class:`pandas.Series`, :class:`pandas.DatetimeIndex`
+    data: :class:`pandas.DataFrame`, :class:`pandas.Series`, :class:`pandas.DatetimeIndex`
         Data represented as a pandas DataFrame, Series, or DatetimeIndex.
+    schema_overrides : dict, default None
+        Support override of inferred types for one or more columns.
     rechunk : bool, default True
         Make sure that all data is in contiguous memory.
     nan_to_null : bool, default True
         If data contains `NaN` values PyArrow will convert the ``NaN`` to ``None``
-    schema_overrides : dict, default None
-        Support override of inferred types for one or more columns.
     include_index : bool, default False
         Load any non-default pandas indexes as columns.
 
@@ -479,23 +625,22 @@ def from_pandas(
         3
     ]
 
-    """
-    if isinstance(df, (pd.Series, pd.DatetimeIndex)):
-        return Series._from_pandas("", df, nan_to_null=nan_to_null)
-    elif isinstance(df, pd.DataFrame):
-        return DataFrame._from_pandas(
-            df,
+    """  # noqa: W505
+    if isinstance(data, (pd.Series, pd.DatetimeIndex)):
+        return pli.Series._from_pandas("", data, nan_to_null=nan_to_null)
+    elif isinstance(data, pd.DataFrame):
+        return pli.DataFrame._from_pandas(
+            data,
             rechunk=rechunk,
             nan_to_null=nan_to_null,
             schema_overrides=schema_overrides,
             include_index=include_index,
         )
     else:
-        raise ValueError(f"Expected pandas DataFrame or Series, got {type(df)}.")
+        raise ValueError(f"Expected pandas DataFrame or Series, got {type(data)}.")
 
 
-@deprecate_nonkeyword_arguments()
-def from_dataframe(df: Any, allow_copy: bool = True) -> DataFrame:
+def from_dataframe(df: Any, *, allow_copy: bool = True) -> DataFrame:
     """
     Build a Polars DataFrame from any dataframe supporting the interchange protocol.
 
@@ -520,14 +665,14 @@ def from_dataframe(df: Any, allow_copy: bool = True) -> DataFrame:
     efficient method of conversion.
 
     """
-    if isinstance(df, DataFrame):
+    if isinstance(df, pli.DataFrame):
         return df
     if not hasattr(df, "__dataframe__"):
         raise TypeError(
             f"`df` of type {type(df)} does not support the dataframe interchange"
             " protocol."
         )
-    if not _PYARROW_AVAILABLE or int(pa.__version__.split(".")[0]) < 11:
+    if not _PYARROW_AVAILABLE or parse_version(pa.__version__) < parse_version("11"):
         raise ImportError(
             "pyarrow>=11.0.0 is required for converting a dataframe interchange object"
             " to a Polars dataframe."

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from typing import Any
 
 import pytest
 
@@ -64,7 +65,7 @@ def test_read_csv_categorical() -> None:
 def test_cat_to_dummies() -> None:
     df = pl.DataFrame({"foo": [1, 2, 3, 4], "bar": ["a", "b", "a", "c"]})
     df = df.with_columns(pl.col("bar").cast(pl.Categorical))
-    assert pl.get_dummies(df).to_dict(False) == {
+    assert df.to_dummies().to_dict(False) == {
         "foo_1": [1, 0, 0, 0],
         "foo_2": [0, 1, 0, 0],
         "foo_3": [0, 0, 1, 0],
@@ -140,8 +141,8 @@ def test_categorical_error_on_local_cmp() -> None:
     with pytest.raises(
         pl.ComputeError,
         match=(
-            "Cannot compare categoricals originating from different sources. Consider"
-            " setting a global string cache."
+            "cannot compare categoricals originating from different sources; consider"
+            " setting a global string cache"
         ),
     ):
         df_cat.filter(pl.col("a_cat") == pl.col("b_cat"))
@@ -158,7 +159,7 @@ def test_shift_and_fill() -> None:
         [pl.col("a").cast(pl.Categorical)]
     )
 
-    s = df.with_columns(pl.col("a").shift_and_fill(1, "c"))["a"]
+    s = df.with_columns(pl.col("a").shift_and_fill("c", periods=1))["a"]
     assert s.dtype == pl.Categorical
     assert s.to_list() == ["c", "a"]
 
@@ -247,13 +248,14 @@ def test_cast_inner_categorical() -> None:
     assert out.to_list() == [["a"], ["a", "b"]]
 
     with pytest.raises(
-        pl.ComputeError, match=r"Casting to 'Categorical' not allowed in 'arr.eval'"
+        pl.ComputeError, match=r"casting to categorical not allowed in `arr.eval`"
     ):
         pl.Series("foo", [["a", "b"], ["a", "b"]]).arr.eval(
             pl.element().cast(pl.Categorical)
         )
 
 
+@pytest.mark.slow()
 def test_stringcache() -> None:
     N = 1_500
     with pl.StringCache():
@@ -264,3 +266,80 @@ def test_stringcache() -> None:
         assert df.filter(pl.col("cats").is_in(["1", "2"])).to_dict(False) == {
             "cats": ["1", "2"]
         }
+
+
+def test_categorical_sort_order(monkeypatch: Any) -> None:
+    with pl.StringCache():
+        # create the categorical ordering first
+        pl.Series(["foo", "bar", "baz"], dtype=pl.Categorical)
+        df = pl.DataFrame(
+            {
+                "n": [0, 0, 0],
+                # use same categories in different order
+                "x": pl.Series(["baz", "bar", "foo"], dtype=pl.Categorical),
+            }
+        )
+
+    assert df.sort(["n", "x"])["x"].to_list() == ["foo", "bar", "baz"]
+    assert df.with_columns(pl.col("x").cat.set_ordering("lexical")).sort(["n", "x"])[
+        "x"
+    ].to_list() == ["bar", "baz", "foo"]
+    monkeypatch.setenv("POLARS_ROW_FMT_SORT", "1")
+    assert df.sort(["n", "x"])["x"].to_list() == ["foo", "bar", "baz"]
+    assert df.with_columns(pl.col("x").cat.set_ordering("lexical")).sort(["n", "x"])[
+        "x"
+    ].to_list() == ["bar", "baz", "foo"]
+
+
+def test_err_on_categorical_asof_join_by_arg() -> None:
+    df1 = pl.DataFrame(
+        [
+            pl.Series("cat", ["a", "foo", "bar", "foo", "bar"], dtype=pl.Categorical),
+            pl.Series("time", [-10, 0, 10, 20, 30], dtype=pl.Int32),
+        ]
+    )
+    df2 = pl.DataFrame(
+        [
+            pl.Series(
+                "cat",
+                ["bar", "bar", "bar", "bar", "foo", "foo", "foo", "foo"],
+                dtype=pl.Categorical,
+            ),
+            pl.Series("time", [-5, 5, 15, 25] * 2, dtype=pl.Int32),
+            pl.Series("x", [1, 2, 3, 4] * 2, dtype=pl.Int32),
+        ]
+    )
+    with pytest.raises(
+        pl.ComputeError,
+        match=r"joins/or comparisons on categoricals can only happen if they were created under the same global string cache",
+    ):
+        df1.join_asof(df2, on="time", by="cat")
+
+
+def test_categorical_list_get_item() -> None:
+    out = pl.Series([["a"]]).cast(pl.List(pl.Categorical)).item()
+    assert isinstance(out, pl.Series)
+    assert out.dtype == pl.Categorical
+
+
+def test_nested_categorical_aggregation_7848() -> None:
+    # a double categorical aggregation
+    assert pl.DataFrame(
+        {
+            "group": [1, 1, 2, 2, 2, 3, 3],
+            "letter": ["a", "b", "c", "d", "e", "f", "g"],
+        }
+    ).with_columns([pl.col("letter").cast(pl.Categorical)]).groupby(
+        maintain_order=True, by=["group"]
+    ).all().with_columns(
+        [pl.col("letter").arr.lengths().alias("c_group")]
+    ).groupby(
+        by=["c_group"], maintain_order=True
+    ).agg(
+        pl.col("letter")
+    ).to_dict(
+        False
+    ) == {
+        "c_group": [2, 3],
+        "letter": [[["a", "b"], ["f", "g"]], [["c", "d", "e"]]],
+    }

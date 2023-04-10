@@ -16,6 +16,8 @@ use crate::chunked_array::cast::cast_chunks;
 use crate::chunked_array::object::extension::polars_extension::PolarsExtension;
 #[cfg(feature = "object")]
 use crate::chunked_array::object::extension::EXTENSION_NAME;
+#[cfg(feature = "dtype-decimal")]
+use crate::config::decimal_is_active;
 use crate::config::verbose;
 use crate::prelude::*;
 
@@ -62,19 +64,17 @@ impl Series {
             Datetime(tu, tz) => Int64Chunked::from_chunks(name, chunks)
                 .into_datetime(*tu, tz.clone())
                 .into_series(),
-            List(_) => ListChunked::from_chunks(name, chunks).cast(dtype).unwrap(),
+            #[cfg(feature = "dtype-decimal")]
+            Decimal(precision, scale) => Int128Chunked::from_chunks(name, chunks)
+                .into_decimal_unchecked(
+                    *precision,
+                    scale.unwrap_or_else(|| unreachable!("scale should be set")),
+                )
+                .into_series(),
+            List(_) => ListChunked::from_chunks_and_dtype_unchecked(name, chunks, dtype.clone())
+                .into_series(),
             Utf8 => Utf8Chunked::from_chunks(name, chunks).into_series(),
-            #[cfg(feature = "dtype-binary")]
-            Binary => {
-                #[cfg(feature = "dtype-binary")]
-                {
-                    BinaryChunked::from_chunks(name, chunks).into_series()
-                }
-                #[cfg(not(feature = "dtype-binary"))]
-                {
-                    panic!("activate feature 'dtype-binary'")
-                }
-            }
+            Binary => BinaryChunked::from_chunks(name, chunks).into_series(),
             #[cfg(feature = "dtype-categorical")]
             Categorical(rev_map) => {
                 let cats = UInt32Chunked::from_chunks(name, chunks);
@@ -109,38 +109,12 @@ impl Series {
                 let chunks = cast_chunks(&chunks, &DataType::Utf8, false).unwrap();
                 Ok(Utf8Chunked::from_chunks(name, chunks).into_series())
             }
-            #[cfg(feature = "dtype-binary")]
             ArrowDataType::LargeBinary => {
                 Ok(BinaryChunked::from_chunks(name, chunks).into_series())
             }
-            #[cfg(feature = "dtype-binary")]
             ArrowDataType::Binary => {
                 let chunks = cast_chunks(&chunks, &DataType::Binary, false).unwrap();
                 Ok(BinaryChunked::from_chunks(name, chunks).into_series())
-            }
-            #[cfg(all(feature = "dtype-u8", not(feature = "dtype-binary")))]
-            ArrowDataType::LargeBinary | ArrowDataType::Binary => {
-                let chunks = chunks
-                    .iter()
-                    .map(|arr| {
-                        let arr = cast(&**arr, &ArrowDataType::LargeBinary).unwrap();
-
-                        let arr = arr.as_any().downcast_ref::<BinaryArray<i64>>().unwrap();
-                        let values = arr.values().clone();
-                        let offsets = arr.offsets().clone();
-                        let validity = arr.validity().cloned();
-
-                        let values =
-                            Box::new(PrimitiveArray::new(ArrowDataType::UInt8, values, None));
-
-                        let dtype = ListArray::<i64>::default_datatype(ArrowDataType::UInt8);
-                        // Safety:
-                        // offsets are monotonically increasing
-                        Box::new(ListArray::<i64>::new(dtype, offsets, values, validity))
-                            as ArrayRef
-                    })
-                    .collect();
-                Ok(ListChunked::from_chunks(name, chunks).into())
             }
             ArrowDataType::List(_) | ArrowDataType::LargeList(_) => {
                 let chunks = chunks.iter().map(convert_inner_types).collect();
@@ -246,9 +220,9 @@ impl Series {
                     value_type.as_ref(),
                     ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 | ArrowDataType::Null
                 ) {
-                    return Err(PolarsError::ComputeError(
-                        "polars only supports dictionaries with string-like values".into(),
-                    ));
+                    polars_bail!(
+                        ComputeError: "only string-like values are supported in dictionaries"
+                    );
                 }
 
                 macro_rules! unpack_keys_values {
@@ -262,34 +236,32 @@ impl Series {
                     }};
                 }
 
-                let (keys, values) =
-                    match key_type {
-                        IntegerType::Int8 => {
-                            unpack_keys_values!(i8)
-                        }
-                        IntegerType::UInt8 => {
-                            unpack_keys_values!(u8)
-                        }
-                        IntegerType::Int16 => {
-                            unpack_keys_values!(i16)
-                        }
-                        IntegerType::UInt16 => {
-                            unpack_keys_values!(u16)
-                        }
-                        IntegerType::Int32 => {
-                            unpack_keys_values!(i32)
-                        }
-                        IntegerType::UInt32 => {
-                            unpack_keys_values!(u32)
-                        }
-                        IntegerType::Int64 => {
-                            unpack_keys_values!(i64)
-                        }
-                        _ => return Err(PolarsError::ComputeError(
-                            "dictionaries with unsigned 64 bits keys are not supported by polars"
-                                .into(),
-                        )),
-                    };
+                let (keys, values) = match key_type {
+                    IntegerType::Int8 => {
+                        unpack_keys_values!(i8)
+                    }
+                    IntegerType::UInt8 => {
+                        unpack_keys_values!(u8)
+                    }
+                    IntegerType::Int16 => {
+                        unpack_keys_values!(i16)
+                    }
+                    IntegerType::UInt16 => {
+                        unpack_keys_values!(u16)
+                    }
+                    IntegerType::Int32 => {
+                        unpack_keys_values!(i32)
+                    }
+                    IntegerType::UInt32 => {
+                        unpack_keys_values!(u32)
+                    }
+                    IntegerType::Int64 => {
+                        unpack_keys_values!(i64)
+                    }
+                    _ => polars_bail!(
+                        ComputeError: "dictionaries with unsigned 64-bit keys are not supported"
+                    ),
+                };
                 let keys = keys.as_any().downcast_ref::<PrimitiveArray<u32>>().unwrap();
                 let values = values.as_any().downcast_ref::<Utf8Array<i64>>().unwrap();
 
@@ -319,7 +291,7 @@ impl Series {
             #[cfg(feature = "dtype-struct")]
             ArrowDataType::Struct(_) => {
                 let arr = if chunks.len() > 1 {
-                    // don't spuriously call this. This triggers a read on mmaped data
+                    // don't spuriously call this. This triggers a read on memmapped data
                     concatenate_owned_unchecked(&chunks).unwrap() as ArrayRef
                 } else {
                     chunks[0].clone()
@@ -364,22 +336,55 @@ impl Series {
                 Ok(StructChunked::new_unchecked(name, &fields).into_series())
             }
             ArrowDataType::FixedSizeBinary(_) => {
-                #[cfg(feature = "dtype-binary")]
-                {
-                    if verbose() {
-                        eprintln!(
-                            "Polars does not support decimal types so the 'Series' are read as Float64"
-                        );
-                    }
-                    let chunks = cast_chunks(&chunks, &DataType::Binary, true)?;
-                    Ok(BinaryChunked::from_chunks(name, chunks).into_series())
+                if verbose() {
+                    eprintln!(
+                        "Polars does not support decimal types so the 'Series' are read as Float64"
+                    );
                 }
-                #[cfg(not(feature = "dtype-binary"))]
+                let chunks = cast_chunks(&chunks, &DataType::Binary, true)?;
+                Ok(BinaryChunked::from_chunks(name, chunks).into_series())
+            }
+            #[cfg(feature = "dtype-decimal")]
+            ArrowDataType::Decimal(precision, scale)
+            | ArrowDataType::Decimal256(precision, scale) => {
+                #[cfg(feature = "python")]
                 {
-                    panic!("activate 'dtype-binary' feature")
+                    let (precision, scale) = (Some(*precision), *scale);
+                    let chunks =
+                        cast_chunks(&chunks, &DataType::Decimal(precision, Some(scale)), false)
+                            .unwrap();
+                    if decimal_is_active() {
+                        Ok(Int128Chunked::from_chunks(name, chunks)
+                            .into_decimal_unchecked(precision, scale)
+                            .into_series())
+                    } else {
+                        if verbose() {
+                            eprintln!(
+                                "Activate beta decimal types to read as decimal. Current behavior casts to Float64."
+                            );
+                        }
+                        Ok(Float64Chunked::from_chunks(
+                            name,
+                            cast_chunks(&chunks, &DataType::Float64, true).unwrap(),
+                        )
+                        .into_series())
+                    }
+                }
+
+                #[cfg(not(feature = "python"))]
+                {
+                    let (precision, scale) = (Some(*precision), *scale);
+                    let chunks =
+                        cast_chunks(&chunks, &DataType::Decimal(precision, Some(scale)), false)
+                            .unwrap();
+                    // or DecimalChunked?
+                    Ok(Int128Chunked::from_chunks(name, chunks)
+                        .into_decimal_unchecked(precision, scale)
+                        .into_series())
                 }
             }
-            ArrowDataType::Decimal(_, _) | ArrowDataType::Decimal256(_, _) => {
+            #[allow(unreachable_patterns)]
+            ArrowDataType::Decimal256(_, _) | ArrowDataType::Decimal(_, _) => {
                 if verbose() {
                     eprintln!(
                         "Polars does not support decimal types so the 'Series' are read as Float64"
@@ -392,9 +397,7 @@ impl Series {
                 .into_series())
             }
             ArrowDataType::Map(_, _) => map_arrays_to_series(name, chunks),
-            dt => Err(PolarsError::InvalidOperation(
-                format!("Cannot create polars series from {dt:?} type").into(),
-            )),
+            dt => polars_bail!(ComputeError: "cannot create series from {:?}", dt),
         }
     }
 }
@@ -430,7 +433,6 @@ fn convert_inner_types(arr: &ArrayRef) -> ArrayRef {
             let out = cast(&**arr, &ArrowDataType::LargeList(field.clone())).unwrap();
             convert_inner_types(&out)
         }
-        #[cfg(feature = "dtype-binary")]
         ArrowDataType::FixedSizeBinary(_) | ArrowDataType::Binary => {
             let out = cast(&**arr, &ArrowDataType::LargeBinary).unwrap();
             convert_inner_types(&out)
@@ -479,15 +481,15 @@ impl TryFrom<(&str, Vec<ArrayRef>)> for Series {
         let mut chunks_iter = chunks.iter();
         let data_type: ArrowDataType = chunks_iter
             .next()
-            .ok_or_else(|| PolarsError::NoData("Expected at least on ArrayRef".into()))?
+            .ok_or_else(|| polars_err!(NoData: "expected at least one array-ref"))?
             .data_type()
             .clone();
 
         for chunk in chunks_iter {
             if chunk.data_type() != &data_type {
-                return Err(PolarsError::InvalidOperation(
-                    "Cannot create series from multiple arrays with different types".into(),
-                ));
+                polars_bail!(
+                    ComputeError: "cannot create series from multiple arrays with different types"
+                );
             }
         }
         // Safety:
@@ -579,20 +581,4 @@ unsafe impl IntoSeries for Series {
 fn new_null(name: &str, chunks: &[ArrayRef]) -> Series {
     let len = chunks.iter().map(|arr| arr.len()).sum();
     Series::new_null(name, len)
-}
-
-#[cfg(test)]
-mod test {
-    #[cfg(all(feature = "dtype-u8", not(feature = "dtype-binary")))]
-    use super::*;
-
-    #[test]
-    #[cfg(all(feature = "dtype-u8", not(feature = "dtype-binary")))]
-    fn test_binary_to_list() {
-        let iter = std::iter::repeat(b"hello").take(2).map(Some);
-        let a = Box::new(iter.collect::<BinaryArray<i32>>()) as ArrayRef;
-
-        let s = Series::try_from(("", a)).unwrap();
-        assert_eq!(s.dtype(), &DataType::List(Box::new(DataType::UInt8)));
-    }
 }

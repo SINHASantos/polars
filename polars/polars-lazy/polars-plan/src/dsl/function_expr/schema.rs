@@ -97,9 +97,7 @@ impl FunctionExpr {
                 if let DataType::Datetime(tu, _) = dt {
                     Ok(DataType::Datetime(*tu, tz.cloned()))
                 } else {
-                    Err(PolarsError::SchemaMisMatch(
-                        format!("expected Datetime got {dt:?}").into(),
-                    ))
+                    polars_bail!(op = "cast-timezone", got = dt, expected = "Datetime");
                 }
             })
         };
@@ -142,7 +140,6 @@ impl FunctionExpr {
                     FromRadix { .. } => with_dtype(DataType::Int32),
                 }
             }
-            #[cfg(feature = "dtype-binary")]
             BinaryExpr(s) => {
                 use BinaryFunction::*;
                 match s {
@@ -157,6 +154,13 @@ impl FunctionExpr {
                     Month | Quarter | Week | WeekDay | Day | OrdinalDay | Hour | Minute
                     | Millisecond | Microsecond | Nanosecond | Second => DataType::UInt32,
                     TimeStamp(_) => DataType::Int64,
+                    IsLeapYear => DataType::Boolean,
+                    Time => DataType::Time,
+                    Date => DataType::Date,
+                    Datetime => match same_type().unwrap().dtype {
+                        DataType::Datetime(tu, _) => DataType::Datetime(tu, None),
+                        dtype => polars_bail!(ComputeError: "expected Datetime, got {}", dtype),
+                    },
                     Truncate(..) => same_type().unwrap().dtype,
                     Round(..) => same_type().unwrap().dtype,
                     #[cfg(feature = "timezones")]
@@ -215,27 +219,21 @@ impl FunctionExpr {
                 match s {
                     FieldByIndex(index) => {
                         let (index, _) = slice_offsets(*index, 0, fields.len());
-                        fields.get(index).cloned().ok_or_else(|| {
-                            PolarsError::ComputeError(
-                                "index out of bounds in 'struct.field'".into(),
-                            )
-                        })
+                        fields.get(index).cloned().ok_or_else(
+                            || polars_err!(ComputeError: "index out of bounds in `struct.field`"),
+                        )
                     }
                     FieldByName(name) => {
                         if let DataType::Struct(flds) = &fields[0].dtype {
                             let fld = flds
                                 .iter()
                                 .find(|fld| fld.name() == name.as_ref())
-                                .ok_or_else(|| {
-                                    PolarsError::StructFieldNotFound(
-                                        name.as_ref().to_string().into(),
-                                    )
-                                })?;
+                                .ok_or_else(
+                                    || polars_err!(StructFieldNotFound: "{}", name.as_ref()),
+                                )?;
                             Ok(fld.clone())
                         } else {
-                            Err(PolarsError::StructFieldNotFound(
-                                name.as_ref().to_string().into(),
-                            ))
+                            polars_bail!(StructFieldNotFound: "{}", name.as_ref());
                         }
                     }
                 }

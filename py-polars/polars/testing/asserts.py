@@ -3,24 +3,24 @@ from __future__ import annotations
 import textwrap
 from typing import Any
 
-import polars.internals as pli
+from polars import functions as F
+from polars.dataframe import DataFrame
 from polars.datatypes import (
-    Boolean,
     Categorical,
     DataTypeClass,
     Float32,
     Float64,
     dtype_to_py_type,
 )
-from polars.exceptions import InvalidAssert, PanicException
-from polars.utils import deprecate_nonkeyword_arguments, deprecated_alias
+from polars.exceptions import ComputeError, InvalidAssert
+from polars.lazyframe import LazyFrame
+from polars.series import Series
 
 
-@deprecate_nonkeyword_arguments()
-@deprecated_alias(check_column_names="check_column_order")
 def assert_frame_equal(
-    left: pli.DataFrame | pli.LazyFrame,
-    right: pli.DataFrame | pli.LazyFrame,
+    left: DataFrame | LazyFrame,
+    right: DataFrame | LazyFrame,
+    *,
     check_dtype: bool = True,
     check_exact: bool = False,
     rtol: float = 1.0e-5,
@@ -65,10 +65,10 @@ def assert_frame_equal(
     >>> assert_frame_equal(df1, df2)  # doctest: +SKIP
     AssertionError: Values for column 'a' are different.
     """
-    if isinstance(left, pli.LazyFrame) and isinstance(right, pli.LazyFrame):
+    if isinstance(left, LazyFrame) and isinstance(right, LazyFrame):
         left, right = left.collect(), right.collect()
         obj = "LazyFrames"
-    elif isinstance(left, pli.DataFrame) and isinstance(right, pli.DataFrame):
+    elif isinstance(left, DataFrame) and isinstance(right, DataFrame):
         obj = "DataFrames"
     else:
         raise_assert_detail("Inputs", "Unexpected input types", type(left), type(right))
@@ -96,7 +96,7 @@ def assert_frame_equal(
         try:
             left = left.sort(by=left.columns)
             right = right.sort(by=left.columns)
-        except PanicException as exc:
+        except ComputeError as exc:
             raise InvalidAssert(
                 "Cannot set 'check_row_order=False' on frame with unsortable columns."
             ) from exc
@@ -118,10 +118,10 @@ def assert_frame_equal(
             raise AssertionError(msg) from exc
 
 
-@deprecate_nonkeyword_arguments()
 def assert_frame_not_equal(
-    left: pli.DataFrame | pli.LazyFrame,
-    right: pli.DataFrame | pli.LazyFrame,
+    left: DataFrame | LazyFrame,
+    right: DataFrame | LazyFrame,
+    *,
     check_dtype: bool = True,
     check_exact: bool = False,
     rtol: float = 1.0e-5,
@@ -184,10 +184,10 @@ def assert_frame_not_equal(
         raise AssertionError("Expected the input frames to be unequal.")
 
 
-@deprecate_nonkeyword_arguments()
 def assert_series_equal(
-    left: pli.Series,
-    right: pli.Series,
+    left: Series,
+    right: Series,
+    *,
     check_dtype: bool = True,
     check_names: bool = True,
     check_exact: bool = False,
@@ -227,8 +227,8 @@ def assert_series_equal(
 
     """
     if not (
-        isinstance(left, pli.Series)  # type: ignore[redundant-expr]
-        and isinstance(right, pli.Series)
+        isinstance(left, Series)  # type: ignore[redundant-expr]
+        and isinstance(right, Series)
     ):
         raise_assert_detail("Inputs", "Unexpected input types", type(left), type(right))
 
@@ -243,10 +243,10 @@ def assert_series_equal(
     )
 
 
-@deprecate_nonkeyword_arguments()
 def assert_series_not_equal(
-    left: pli.Series,
-    right: pli.Series,
+    left: Series,
+    right: Series,
+    *,
     check_dtype: bool = True,
     check_names: bool = True,
     check_exact: bool = False,
@@ -303,8 +303,8 @@ def assert_series_not_equal(
 
 
 def _assert_series_inner(
-    left: pli.Series,
-    right: pli.Series,
+    left: Series,
+    right: Series,
     check_dtype: bool,
     check_exact: bool,
     nans_compare_equal: bool,
@@ -317,7 +317,9 @@ def _assert_series_inner(
     except NotImplementedError:
         can_be_subtracted = False
 
-    check_exact = check_exact or not can_be_subtracted or left.dtype == Boolean
+    check_exact = (
+        check_exact or not can_be_subtracted or left.is_boolean() or left.is_temporal()
+    )
     if check_dtype and left.dtype != right.dtype:
         raise_assert_detail("Series", "Dtype mismatch", left.dtype, right.dtype)
 
@@ -330,9 +332,7 @@ def _assert_series_inner(
     unequal = left != right
     if unequal.any() and nans_compare_equal and comparing_float_dtypes:
         # handle NaN values (which compare unequal to themselves)
-        unequal = unequal & ~(
-            (left.is_nan() & right.is_nan()).fill_null(pli.lit(False))
-        )
+        unequal = unequal & ~((left.is_nan() & right.is_nan()).fill_null(F.lit(False)))
 
     # assert exact, or with tolerance
     if unequal.any():
@@ -398,9 +398,7 @@ def is_categorical_dtype(data_type: Any) -> bool:
     )
 
 
-def assert_frame_equal_local_categoricals(
-    df_a: pli.DataFrame, df_b: pli.DataFrame
-) -> None:
+def assert_frame_equal_local_categoricals(df_a: DataFrame, df_b: DataFrame) -> None:
     """Assert frame equal for frames containing categoricals."""
     for (a_name, a_value), (b_name, b_value) in zip(
         df_a.schema.items(), df_b.schema.items()
@@ -412,7 +410,7 @@ def assert_frame_equal_local_categoricals(
             print(f"{a_value} != {b_value}")
             raise AssertionError
 
-    cat_to_str = pli.col(Categorical).cast(str)
+    cat_to_str = F.col(Categorical).cast(str)
     assert_frame_equal(df_a.with_columns(cat_to_str), df_b.with_columns(cat_to_str))
-    cat_to_phys = pli.col(Categorical).to_physical()
+    cat_to_phys = F.col(Categorical).to_physical()
     assert_frame_equal(df_a.with_columns(cat_to_phys), df_b.with_columns(cat_to_phys))

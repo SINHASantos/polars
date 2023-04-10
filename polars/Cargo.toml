@@ -12,7 +12,7 @@ description = "DataFrame Library based on Apache Arrow"
 [features]
 sql = ["polars-sql"]
 rows = ["polars-core/rows"]
-simd = ["polars-core/simd"]
+simd = ["polars-core/simd", "polars-io/simd"]
 avx512 = ["polars-core/avx512"]
 nightly = ["polars-core/nightly", "polars-ops/nightly", "simd"]
 docs = ["polars-core/docs"]
@@ -100,7 +100,7 @@ mode = ["polars-core/mode", "polars-lazy/mode"]
 take_opt_iter = ["polars-core/take_opt_iter"]
 extract_jsonpath = ["polars-core/strings", "polars-ops/extract_jsonpath", "polars-ops/strings"]
 string_encoding = ["polars-ops/string_encoding", "polars-core/strings"]
-binary_encoding = ["polars-ops/binary_encoding", "dtype-binary"]
+binary_encoding = ["polars-ops/binary_encoding"]
 groupby_list = ["polars-core/groupby_list"]
 lazy_regex = ["polars-lazy/regex"]
 cum_agg = ["polars-core/cum_agg", "polars-core/cum_agg"]
@@ -180,12 +180,11 @@ dtype-full = [
   "dtype-time",
   "dtype-i8",
   "dtype-i16",
-  "dtype-i128",
+  "dtype-decimal",
   "dtype-u8",
   "dtype-u16",
   "dtype-categorical",
   "dtype-struct",
-  "dtype-binary",
 ]
 
 # sensible minimal set of opt-in datatypes
@@ -202,6 +201,7 @@ dtype-date = [
   "polars-io/dtype-date",
   "polars-time/dtype-date",
   "polars-core/dtype-date",
+  "polars-ops/dtype-date",
 ]
 dtype-datetime = [
   "polars-core/dtype-datetime",
@@ -215,11 +215,12 @@ dtype-duration = [
   "polars-lazy/dtype-duration",
   "polars-time/dtype-duration",
   "polars-core/dtype-duration",
+  "polars-ops/dtype-duration",
 ]
 dtype-time = ["polars-core/dtype-time", "polars-io/dtype-time", "polars-time/dtype-time", "polars-ops/dtype-time"]
 dtype-i8 = ["polars-core/dtype-i8", "polars-lazy/dtype-i8", "polars-ops/dtype-i8"]
 dtype-i16 = ["polars-core/dtype-i16", "polars-lazy/dtype-i16", "polars-ops/dtype-i16"]
-dtype-i128 = ["polars-core/dtype-i128", "polars-lazy/dtype-i128", "polars-ops/dtype-i128"]
+dtype-decimal = ["polars-core/dtype-decimal", "polars-lazy/dtype-decimal", "polars-ops/dtype-decimal"]
 dtype-u8 = ["polars-core/dtype-u8", "polars-lazy/dtype-u8", "polars-ops/dtype-u8"]
 dtype-u16 = ["polars-core/dtype-u16", "polars-lazy/dtype-u16", "polars-ops/dtype-u16"]
 dtype-categorical = [
@@ -234,12 +235,6 @@ dtype-struct = [
   "polars-ops/dtype-struct",
   "polars-io/dtype-struct",
 ]
-dtype-binary = [
-  "polars-core/dtype-binary",
-  "polars-lazy/dtype-binary",
-  "polars-ops/dtype-binary",
-  "polars-io/dtype-binary",
-]
 
 docs-selection = [
   "csv-file",
@@ -249,7 +244,6 @@ docs-selection = [
   "ipc_streaming",
   "dtype-full",
   "is_in",
-  "sort_multiple",
   "rows",
   "docs",
   "strings",
@@ -299,13 +293,13 @@ bench = [
 ]
 
 [dependencies]
-polars-algo = { version = "0.27.2", path = "./polars-algo", optional = true }
-polars-core = { version = "0.27.2", path = "./polars-core", features = ["docs", "private"], default-features = false }
-polars-io = { version = "0.27.2", path = "./polars-io", features = ["private"], default-features = false, optional = true }
-polars-lazy = { version = "0.27.2", path = "./polars-lazy", features = ["private"], default-features = false, optional = true }
-polars-ops = { version = "0.27.2", path = "./polars-ops" }
-polars-sql = { version = "0.2", path = "./polars-sql", default-features = false, optional = true }
-polars-time = { version = "0.27.2", path = "./polars-time", default-features = false, optional = true }
+polars-algo = { version = "0.28.0", path = "./polars-algo", optional = true }
+polars-core = { version = "0.28.0", path = "./polars-core", features = ["docs", "private"], default-features = false }
+polars-io = { version = "0.28.0", path = "./polars-io", features = ["private"], default-features = false, optional = true }
+polars-lazy = { version = "0.28.0", path = "./polars-lazy", features = ["private"], default-features = false, optional = true }
+polars-ops = { version = "0.28.0", path = "./polars-ops" }
+polars-sql = { version = "0.28.0", path = "./polars-sql", default-features = false, optional = true }
+polars-time = { version = "0.28.0", path = "./polars-time", default-features = false, optional = true }
 
 # enable js feature for getrandom to work in wasm
 [target.'cfg(target_family = "wasm")'.dependencies.getrandom]

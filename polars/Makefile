@@ -27,13 +27,14 @@ clippy:
 	    -p polars-utils \
 	    -p polars-ops \
 	    -p polars-error \
+	    -p polars-row \
 	    -p polars-time
 
 clippy-default:
 	cargo clippy
 
 test:  ## Run tests
-	POLARS_MAX_THREADS=4 cargo t -p polars-core test_4_threads
+	POLARS_NO_STREAMING_GROUPBY=1 POLARS_MAX_THREADS=4 cargo t -p polars-core test_4_threads
 	cargo test --all-features \
 	    -p polars-lazy \
 	    -p polars-io \
@@ -41,6 +42,7 @@ test:  ## Run tests
 	    -p polars-arrow \
 	    -p polars-time \
 	    -p polars-utils \
+	    -p polars-row \
 	    -- \
 	    --test-threads=2
 
@@ -90,9 +92,13 @@ doctest:
 	cargo doc --features=docs-selection -p polars
 
 publish:
-	cargo publish --allow-dirty -p polars-error
-	sleep 20
-	cargo publish --allow-dirty -p polars-utils
+#	cargo publish --allow-dirty -p polars-error
+#	sleep 20
+#	cargo publish --allow-dirty -p polars-utils
+#	sleep 20
+#	cargo publish --allow-dirty -p polars-row
+#	sleep 20
+	cargo publish --allow-dirty -p polars-arrow
 	sleep 20
 	cargo publish --allow-dirty -p polars-core
 	sleep 20

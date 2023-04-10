@@ -1,6 +1,8 @@
 use polars_arrow::array::ValueSize;
 #[cfg(feature = "dtype-struct")]
 use polars_arrow::export::arrow::array::{MutableArray, MutableUtf8Array};
+#[cfg(feature = "dtype-struct")]
+use polars_utils::format_smartstring;
 
 use super::function_expr::StringFunction;
 use super::*;
@@ -21,7 +23,8 @@ impl StringNameSpace {
         )
     }
 
-    /// Check if a string value contains a Regex substring.
+    /// Check if this column of strings contains a Regex. If `strict` is `true`, then it is an error if any `pat` is
+    /// an invalid regex, whereas if `strict` is `false`, an invalid regex will simply evaluate to `false`.
     #[cfg(feature = "regex")]
     pub fn contains(self, pat: Expr, strict: bool) -> Expr {
         self.0.map_many_private(
@@ -52,7 +55,7 @@ impl StringNameSpace {
         )
     }
 
-    /// Extract a regex pattern from the a string value.
+    /// Extract a regex pattern from the a string value. If `group_index` is out of bounds, null is returned.
     pub fn extract(self, pat: &str, group_index: usize) -> Expr {
         let pat = pat.to_string();
         self.0
@@ -98,6 +101,7 @@ impl StringNameSpace {
         self.0.map_private(StringFunction::CountMatch(pat).into())
     }
 
+    /// Construct a `Datetime` column by parsing this string column as datetimes, using the provided `options`.
     #[cfg(feature = "temporal")]
     pub fn strptime(self, options: StrpTimeOptions) -> Expr {
         self.0.map_private(StringFunction::Strptime(options).into())
@@ -217,7 +221,9 @@ impl StringNameSpace {
                 function,
                 GetOutput::from_type(DataType::Struct(
                     (0..n + 1)
-                        .map(|i| Field::from_owned(format!("field_{i}"), DataType::Utf8))
+                        .map(|i| {
+                            Field::from_owned(format_smartstring!("field_{i}"), DataType::Utf8)
+                        })
                         .collect(),
                 )),
             )
@@ -269,7 +275,9 @@ impl StringNameSpace {
                 function,
                 GetOutput::from_type(DataType::Struct(
                     (0..n + 1)
-                        .map(|i| Field::from_owned(format!("field_{i}"), DataType::Utf8))
+                        .map(|i| {
+                            Field::from_owned(format_smartstring!("field_{i}"), DataType::Utf8)
+                        })
                         .collect(),
                 )),
             )
@@ -321,7 +329,9 @@ impl StringNameSpace {
                 function,
                 GetOutput::from_type(DataType::Struct(
                     (0..n)
-                        .map(|i| Field::from_owned(format!("field_{i}"), DataType::Utf8))
+                        .map(|i| {
+                            Field::from_owned(format_smartstring!("field_{i}"), DataType::Utf8)
+                        })
                         .collect(),
                 )),
             )
@@ -332,10 +342,17 @@ impl StringNameSpace {
     /// Replace values that match a regex `pat` with a `value`.
     pub fn replace(self, pat: Expr, value: Expr, literal: bool) -> Expr {
         self.0.map_many_private(
-            FunctionExpr::StringExpr(StringFunction::Replace {
-                all: false,
-                literal,
-            }),
+            FunctionExpr::StringExpr(StringFunction::Replace { n: 1, literal }),
+            &[pat, value],
+            true,
+        )
+    }
+
+    #[cfg(feature = "regex")]
+    /// Replace values that match a regex `pat` with a `value`.
+    pub fn replace_n(self, pat: Expr, value: Expr, literal: bool, n: i64) -> Expr {
+        self.0.map_many_private(
+            FunctionExpr::StringExpr(StringFunction::Replace { n, literal }),
             &[pat, value],
             true,
         )
@@ -345,7 +362,7 @@ impl StringNameSpace {
     /// Replace all values that match a regex `pat` with a `value`.
     pub fn replace_all(self, pat: Expr, value: Expr, literal: bool) -> Expr {
         self.0.map_many_private(
-            FunctionExpr::StringExpr(StringFunction::Replace { all: true, literal }),
+            FunctionExpr::StringExpr(StringFunction::Replace { n: -1, literal }),
             &[pat, value],
             true,
         )
@@ -383,8 +400,10 @@ impl StringNameSpace {
 
     #[cfg(feature = "string_from_radix")]
     /// Parse string in base radix into decimal
-    pub fn from_radix(self, radix: Option<u32>) -> Expr {
+    pub fn from_radix(self, radix: u32, strict: bool) -> Expr {
         self.0
-            .map_private(FunctionExpr::StringExpr(StringFunction::FromRadix(radix)))
+            .map_private(FunctionExpr::StringExpr(StringFunction::FromRadix(
+                radix, strict,
+            )))
     }
 }

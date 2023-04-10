@@ -89,7 +89,11 @@ impl private::PrivateSeries for SeriesWrap<CategoricalChunked> {
             .map(|ca| ca.into_series())
     }
     fn into_partial_ord_inner<'a>(&'a self) -> Box<dyn PartialOrdInner + 'a> {
-        (&self.0).into_partial_ord_inner()
+        if self.0.use_lexical_sort() {
+            (&self.0).into_partial_ord_inner()
+        } else {
+            self.0.logical().into_partial_ord_inner()
+        }
     }
 
     fn vec_hash(&self, random_state: RandomState, buf: &mut Vec<u64>) -> PolarsResult<()> {
@@ -136,10 +140,16 @@ impl private::PrivateSeries for SeriesWrap<CategoricalChunked> {
         }
     }
     fn group_tuples(&self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
-        self.0.logical().group_tuples(multithreaded, sorted)
+        #[cfg(feature = "performant")]
+        {
+            Ok(self.0.group_tuples_perfect(multithreaded, sorted))
+        }
+        #[cfg(not(feature = "performant"))]
+        {
+            self.0.logical().group_tuples(multithreaded, sorted)
+        }
     }
 
-    #[cfg(feature = "sort_multiple")]
     fn arg_sort_multiple(&self, by: &[Series], descending: &[bool]) -> PolarsResult<IdxCa> {
         self.0.arg_sort_multiple(by, descending)
     }
@@ -180,28 +190,19 @@ impl SeriesTrait for SeriesWrap<CategoricalChunked> {
     }
 
     fn append(&mut self, other: &Series) -> PolarsResult<()> {
-        if self.0.dtype() == other.dtype() {
-            self.0.append(other.categorical().unwrap())
-        } else {
-            Err(PolarsError::SchemaMisMatch(
-                "cannot append Series; data types don't match".into(),
-            ))
-        }
+        polars_ensure!(self.0.dtype() == other.dtype(), append);
+        self.0.append(other.categorical().unwrap())
     }
+
     fn extend(&mut self, other: &Series) -> PolarsResult<()> {
-        if self.0.dtype() == other.dtype() {
-            let other = other.categorical()?;
-            self.0.logical_mut().extend(other.logical());
-            let new_rev_map = self.0.merge_categorical_map(other)?;
-            // safety:
-            // rev_maps are merged
-            unsafe { self.0.set_rev_map(new_rev_map, false) };
-            Ok(())
-        } else {
-            Err(PolarsError::SchemaMisMatch(
-                "cannot extend Series; data types don't match".into(),
-            ))
-        }
+        polars_ensure!(self.0.dtype() == other.dtype(), extend);
+        let other = other.categorical()?;
+        self.0.logical_mut().extend(other.logical());
+        let new_rev_map = self.0.merge_categorical_map(other)?;
+        // SAFETY
+        // rev_maps are merged
+        unsafe { self.0.set_rev_map(new_rev_map, false) };
+        Ok(())
     }
 
     fn filter(&self, filter: &BooleanChunked) -> PolarsResult<Series> {
@@ -392,7 +393,8 @@ impl SeriesTrait for SeriesWrap<CategoricalChunked> {
 
     #[cfg(feature = "mode")]
     fn mode(&self) -> PolarsResult<Series> {
-        Ok(CategoricalChunked::full_null(self.0.logical().name(), 1).into_series())
+        let cats = self.0.logical().mode()?;
+        Ok(self.finish_with_state(false, cats).into_series())
     }
 }
 

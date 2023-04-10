@@ -1,13 +1,13 @@
-//! Domain specific language for the Lazy api.
+#![allow(ambiguous_glob_reexports)]
+//! Domain specific language for the Lazy API.
 #[cfg(feature = "dtype-categorical")]
 pub mod cat;
 #[cfg(feature = "dtype-categorical")]
 pub use cat::*;
 mod arithmetic;
-#[cfg(feature = "dtype-binary")]
 pub mod binary;
 #[cfg(feature = "temporal")]
-mod dt;
+pub mod dt;
 mod expr;
 mod from;
 pub(crate) mod function_expr;
@@ -46,6 +46,7 @@ use crate::utils::has_expr;
 #[cfg(feature = "is_in")]
 use crate::utils::has_root_literal_expr;
 
+/// Compute `op(l, r)` (or equivalently `l op r`). `l` and `r` must have types compatible with the Operator.
 pub fn binary_expr(l: Expr, op: Operator, r: Expr) -> Expr {
     Expr::BinaryExpr {
         left: Box::new(l),
@@ -614,8 +615,22 @@ impl Expr {
     ///
     /// This has time complexity `O(n + k log(n))`.
     #[cfg(feature = "top_k")]
-    pub fn top_k(self, k: usize, descending: bool) -> Self {
-        self.apply_private(FunctionExpr::TopK { k, descending })
+    pub fn top_k(self, k: usize) -> Self {
+        self.apply_private(FunctionExpr::TopK {
+            k,
+            descending: false,
+        })
+    }
+
+    /// Returns the `k` smallest elements.
+    ///
+    /// This has time complexity `O(n + k log(n))`.
+    #[cfg(feature = "top_k")]
+    pub fn bottom_k(self, k: usize) -> Self {
+        self.apply_private(FunctionExpr::TopK {
+            k,
+            descending: true,
+        })
     }
 
     /// Reverse column
@@ -963,6 +978,7 @@ impl Expr {
                 match dt {
                     Float32 => Float32,
                     Float64 => Float64,
+                    UInt64 => UInt64,
                     _ => Int64,
                 }
             }),
@@ -1088,7 +1104,7 @@ impl Expr {
     /// │ 1      ┆ 16     │
     /// │ 2      ┆ 13     │
     /// │ 2      ┆ 13     │
-    /// │ ...    ┆ ...    │
+    /// │ …      ┆ …      │
     /// │ 1      ┆ 16     │
     /// │ 2      ┆ 13     │
     /// │ 3      ┆ 15     │
@@ -1271,7 +1287,7 @@ impl Expr {
     /// Get a mask of the first unique value.
     pub fn is_first(self) -> Expr {
         self.apply(
-            |s| is_first(&s).map(|s| Some(s.into_series())),
+            |s| polars_ops::prelude::is_first(&s).map(|s| Some(s.into_series())),
             GetOutput::from_type(DataType::Boolean),
         )
         .with_fmt("is_first")
@@ -1400,19 +1416,22 @@ impl Expr {
                     by = by.rechunk();
                     let s = &s[0];
 
-                    if options.weights.is_some() {
-                        return Err(PolarsError::ComputeError(
-                            "weights not supported in 'rolling by' expression".into(),
-                        ));
-                    }
-
-                    if matches!(by.dtype(), DataType::Datetime(_, _)) {
-                        by = by.cast(&DataType::Datetime(TimeUnit::Microseconds, None))?;
-                    }
+                    polars_ensure!(
+                        options.weights.is_none(),
+                        ComputeError: "`weights` is not supported in 'rolling by' expression"
+                    );
+                    let (by, tz) = match by.dtype() {
+                        DataType::Datetime(_, tz) => (
+                            by.cast(&DataType::Datetime(TimeUnit::Microseconds, None))?,
+                            tz,
+                        ),
+                        _ => (by.clone(), &None),
+                    };
                     let by = by.datetime().unwrap();
                     let by_values = by.cont_slice().map_err(|_| {
-                        PolarsError::ComputeError(
-                            "'by' column should not have null values in 'rolling by'".into(),
+                        polars_err!(
+                            ComputeError:
+                            "`by` column should not have null values in 'rolling by' expression"
                         )
                     })?;
                     let tu = by.time_unit();
@@ -1424,6 +1443,7 @@ impl Expr {
                         center: options.center,
                         by: Some(by_values),
                         tu: Some(tu),
+                        tz: tz.as_ref(),
                         closed_window: options.closed_window,
                     };
 
@@ -1615,9 +1635,9 @@ impl Expr {
     }
 
     #[cfg(feature = "rank")]
-    pub fn rank(self, options: RankOptions) -> Expr {
+    pub fn rank(self, options: RankOptions, seed: Option<u64>) -> Expr {
         self.apply(
-            move |s| Ok(Some(s.rank(options))),
+            move |s| Ok(Some(s.rank(options, seed))),
             GetOutput::map_field(move |fld| match options.method {
                 RankMethod::Average => Field::new(fld.name(), DataType::Float32),
                 _ => Field::new(fld.name(), IDX_DTYPE),
@@ -1707,11 +1727,9 @@ impl Expr {
                     UInt64 => Series::new(name, &[u64::MAX]),
                     Float32 => Series::new(name, &[f32::INFINITY]),
                     Float64 => Series::new(name, &[f64::INFINITY]),
-                    dt => {
-                        return Err(PolarsError::ComputeError(
-                            format!("cannot determine upper bound of dtype {dt}").into(),
-                        ))
-                    }
+                    dt => polars_bail!(
+                        ComputeError: "cannot determine upper bound for dtype `{}`", dt,
+                    ),
                 };
                 Ok(Some(s))
             },
@@ -1741,11 +1759,9 @@ impl Expr {
                     UInt64 => Series::new(name, &[u64::MIN]),
                     Float32 => Series::new(name, &[f32::NEG_INFINITY]),
                     Float64 => Series::new(name, &[f64::NEG_INFINITY]),
-                    dt => {
-                        return Err(PolarsError::ComputeError(
-                            format!("cannot determine lower bound of dtype {dt}").into(),
-                        ))
-                    }
+                    dt => polars_bail!(
+                        ComputeError: "cannot determine lower bound for dtype `{}`", dt,
+                    ),
                 };
                 Ok(Some(s))
             },
@@ -2039,7 +2055,6 @@ impl Expr {
         string::StringNameSpace(self)
     }
 
-    #[cfg(feature = "dtype-binary")]
     pub fn binary(self) -> binary::BinaryNameSpace {
         binary::BinaryNameSpace(self)
     }

@@ -84,16 +84,14 @@ where
         match data_type {
             #[cfg(feature = "dtype-categorical")]
             DataType::Categorical(_) => {
-                if self.dtype() == &DataType::UInt32 {
-                    // safety:
-                    // we are guarded by the type system.
-                    let ca = unsafe { &*(self as *const ChunkedArray<T> as *const UInt32Chunked) };
-                    CategoricalChunked::from_global_indices(ca.clone()).map(|ca| ca.into_series())
-                } else {
-                    Err(PolarsError::ComputeError(
-                        "Cannot cast numeric types to 'Categorical'".into(),
-                    ))
-                }
+                polars_ensure!(
+                    self.dtype() == &DataType::UInt32,
+                    ComputeError: "cannot cast numeric types to 'Categorical'"
+                );
+                // SAFETY
+                // we are guarded by the type system
+                let ca = unsafe { &*(self as *const ChunkedArray<T> as *const UInt32Chunked) };
+                CategoricalChunked::from_global_indices(ca.clone()).map(|ca| ca.into_series())
             }
             #[cfg(feature = "dtype-struct")]
             DataType::Struct(fields) => cast_single_to_struct(self.name(), &self.chunks, fields),
@@ -121,7 +119,7 @@ where
         self.cast_impl(data_type, true)
     }
 
-    fn cast_unchecked(&self, data_type: &DataType) -> PolarsResult<Series> {
+    unsafe fn cast_unchecked(&self, data_type: &DataType) -> PolarsResult<Series> {
         match data_type {
             #[cfg(feature = "dtype-categorical")]
             DataType::Categorical(Some(rev_map)) => {
@@ -137,9 +135,7 @@ where
                     }
                     .into_series())
                 } else {
-                    Err(PolarsError::ComputeError(
-                        "Cannot cast numeric types to 'Categorical'".into(),
-                    ))
+                    polars_bail!(ComputeError: "cannot cast numeric types to 'Categorical'");
                 }
             }
             _ => self.cast_impl(data_type, false),
@@ -164,12 +160,11 @@ impl ChunkCast for Utf8Chunked {
         }
     }
 
-    fn cast_unchecked(&self, data_type: &DataType) -> PolarsResult<Series> {
+    unsafe fn cast_unchecked(&self, data_type: &DataType) -> PolarsResult<Series> {
         self.cast(data_type)
     }
 }
 
-#[cfg(feature = "dtype-binary")]
 unsafe fn binary_to_utf8_unchecked(from: &BinaryArray<i64>) -> Utf8Array<i64> {
     let values = from.values().clone();
     let offsets = from.offsets().clone();
@@ -182,7 +177,33 @@ unsafe fn binary_to_utf8_unchecked(from: &BinaryArray<i64>) -> Utf8Array<i64> {
     .unwrap()
 }
 
-#[cfg(feature = "dtype-binary")]
+impl BinaryChunked {
+    /// # Safety
+    /// Utf8 is not validated
+    pub unsafe fn to_utf8(&self) -> Utf8Chunked {
+        let chunks = self
+            .downcast_iter()
+            .map(|arr| Box::new(binary_to_utf8_unchecked(arr)) as ArrayRef)
+            .collect();
+        Utf8Chunked::from_chunks(self.name(), chunks)
+    }
+}
+
+impl Utf8Chunked {
+    pub fn as_binary(&self) -> BinaryChunked {
+        let chunks = self
+            .downcast_iter()
+            .map(|arr| {
+                Box::new(arrow::compute::cast::utf8_to_binary(
+                    arr,
+                    ArrowDataType::LargeBinary,
+                )) as ArrayRef
+            })
+            .collect();
+        unsafe { BinaryChunked::from_chunks(self.name(), chunks) }
+    }
+}
+
 impl ChunkCast for BinaryChunked {
     fn cast(&self, data_type: &DataType) -> PolarsResult<Series> {
         match data_type {
@@ -192,15 +213,9 @@ impl ChunkCast for BinaryChunked {
         }
     }
 
-    fn cast_unchecked(&self, data_type: &DataType) -> PolarsResult<Series> {
+    unsafe fn cast_unchecked(&self, data_type: &DataType) -> PolarsResult<Series> {
         match data_type {
-            DataType::Utf8 => unsafe {
-                let chunks = self
-                    .downcast_iter()
-                    .map(|arr| Box::new(binary_to_utf8_unchecked(arr)) as ArrayRef)
-                    .collect();
-                Ok(Utf8Chunked::from_chunks(self.name(), chunks).into_series())
-            },
+            DataType::Utf8 => unsafe { Ok(self.to_utf8().into_series()) },
             _ => self.cast(data_type),
         }
     }
@@ -230,7 +245,7 @@ impl ChunkCast for BooleanChunked {
         }
     }
 
-    fn cast_unchecked(&self, data_type: &DataType) -> PolarsResult<Series> {
+    unsafe fn cast_unchecked(&self, data_type: &DataType) -> PolarsResult<Series> {
         self.cast(data_type)
     }
 }
@@ -266,6 +281,10 @@ impl ChunkCast for ListChunked {
                             )
                         })
                     }
+                    #[cfg(feature = "dtype-categorical")]
+                    (dt, Categorical(None)) => {
+                        polars_bail!(ComputeError: "cannot cast list inner type: '{:?}' to Categorical", dt)
+                    }
                     _ if phys_child.is_primitive() => {
                         let mut ca = if child_type.to_physical() != self.inner_dtype().to_physical()
                         {
@@ -282,15 +301,23 @@ impl ChunkCast for ListChunked {
                     }
                     _ => {
                         let arr = cast_list(self, child_type)?.0;
-                        Series::try_from((self.name(), arr))
+                        // Safety: we just casted so the dtype matches.
+                        // we must take this path to correct for physical types.
+                        unsafe {
+                            Ok(Series::from_chunks_and_dtype_unchecked(
+                                self.name(),
+                                vec![arr],
+                                data_type,
+                            ))
+                        }
                     }
                 }
             }
-            _ => Err(PolarsError::ComputeError("Cannot cast list type".into())),
+            _ => polars_bail!(ComputeError: "cannot cast list type"),
         }
     }
 
-    fn cast_unchecked(&self, data_type: &DataType) -> PolarsResult<Series> {
+    unsafe fn cast_unchecked(&self, data_type: &DataType) -> PolarsResult<Series> {
         self.cast(data_type)
     }
 }

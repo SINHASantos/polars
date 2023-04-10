@@ -16,6 +16,7 @@ mod fast_projection;
     feature = "cse"
 ))]
 pub(crate) mod file_caching;
+mod flatten_union;
 mod predicate_pushdown;
 mod projection_pushdown;
 mod simplify_expr;
@@ -36,6 +37,7 @@ use slice_pushdown_lp::SlicePushDown;
 pub use stack_opt::{OptimizationRule, StackOptimizer};
 pub use type_coercion::TypeCoercionRule;
 
+use self::flatten_union::FlattenUnionRule;
 pub use crate::frame::{AllowedOptimizations, OptState};
 
 pub trait Optimize {
@@ -66,12 +68,12 @@ pub fn optimize(
     #[cfg(feature = "cse")]
     let cse = opt_state.common_subplan_elimination;
 
+    #[allow(unused_variables)]
     let agg_scan_projection = opt_state.file_caching;
 
     // gradually fill the rules passed to the optimizer
     let opt = StackOptimizer {};
     let mut rules: Vec<Box<dyn OptimizationRule>> = Vec::with_capacity(8);
-
     // during debug we check if the optimizations have not modified the final schema
     #[cfg(debug_assertions)]
     let prev_schema = logical_plan.schema()?.into_owned();
@@ -175,6 +177,7 @@ pub fn optimize(
     }
 
     rules.push(Box::new(ReplaceDropNulls {}));
+    rules.push(Box::new(FlattenUnionRule {}));
 
     lp_top = opt.optimize_loop(&mut rules, expr_arena, lp_arena, lp_top)?;
 
@@ -193,49 +196,4 @@ pub fn optimize(
     };
 
     Ok(lp_top)
-}
-
-#[cfg(test)]
-fn optimize_lp(lp: LogicalPlan, rules: &mut [Box<dyn OptimizationRule>]) -> LogicalPlan {
-    // initialize arena's
-    let mut expr_arena = Arena::with_capacity(64);
-    let mut lp_arena = Arena::with_capacity(32);
-    let root = to_alp(lp, &mut expr_arena, &mut lp_arena).unwrap();
-
-    let opt = StackOptimizer {};
-    let lp_top = opt.optimize_loop(rules, &mut expr_arena, &mut lp_arena, root);
-    node_to_lp(lp_top, &mut expr_arena, &mut lp_arena)
-}
-
-#[cfg(test)]
-fn optimize_expr(expr: Expr, schema: Schema, rules: &mut [Box<dyn OptimizationRule>]) -> Expr {
-    // initialize arena's
-    let mut expr_arena = Arena::with_capacity(64);
-    let mut lp_arena = Arena::with_capacity(32);
-    let schema = Arc::new(schema);
-
-    // dummy input needed to put the schema
-    let input = Box::new(LogicalPlan::Projection {
-        expr: vec![],
-        input: Box::new(Default::default()),
-        schema: schema.clone(),
-    });
-
-    let lp = LogicalPlan::Projection {
-        expr: vec![expr],
-        input,
-        schema,
-    };
-
-    let root = to_alp(lp, &mut expr_arena, &mut lp_arena).unwrap();
-
-    let opt = StackOptimizer {};
-    let lp_top = opt.optimize_loop(rules, &mut expr_arena, &mut lp_arena, root);
-    if let LogicalPlan::Projection { mut expr, .. } =
-        node_to_lp(lp_top, &mut expr_arena, &mut lp_arena)
-    {
-        expr.pop().unwrap()
-    } else {
-        unreachable!()
-    }
 }

@@ -6,13 +6,11 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from math import isfinite
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 from hypothesis import settings
 from hypothesis.errors import InvalidArgument, NonInteractiveExampleWarning
 from hypothesis.strategies import (
-    DrawFn,
-    SearchStrategy,
     booleans,
     composite,
     dates,
@@ -28,7 +26,7 @@ from hypothesis.strategies import (
 )
 from hypothesis.strategies._internal.utils import defines_strategy
 
-import polars.internals as pli
+from polars.dataframe import DataFrame
 from polars.datatypes import (
     Boolean,
     Categorical,
@@ -41,7 +39,6 @@ from polars.datatypes import (
     Int16,
     Int32,
     Int64,
-    PolarsDataType,
     Time,
     UInt8,
     UInt16,
@@ -51,8 +48,15 @@ from polars.datatypes import (
     is_polars_dtype,
     py_type_to_dtype,
 )
+from polars.series import Series
 from polars.string_cache import StringCache
 from polars.testing.asserts import is_categorical_dtype
+
+if TYPE_CHECKING:
+    from hypothesis.strategies import DrawFn, SearchStrategy
+
+    from polars.lazyframe import LazyFrame
+    from polars.type_aliases import OneOrMoreDataTypes, PolarsDataType
 
 # Default profile (eg: running locally)
 common_settings = {"print_blob": True, "deadline": None}
@@ -164,7 +168,7 @@ class column:
 
     name: str
     dtype: PolarsDataType | None = None
-    strategy: SearchStrategy[pli.Series | int] | None = None
+    strategy: SearchStrategy[Series | int] | None = None
     null_probability: float | None = None
     unique: bool = False
 
@@ -210,7 +214,7 @@ class column:
 def columns(
     cols: int | Sequence[str] | None = None,
     *,
-    dtype: PolarsDataType | Sequence[PolarsDataType] | None = None,
+    dtype: OneOrMoreDataTypes | None = None,
     min_cols: int | None = 0,
     max_cols: int | None = MAX_COLS,
     unique: bool = False,
@@ -306,7 +310,7 @@ def series(
     chunked: bool | None = None,
     allowed_dtypes: Sequence[PolarsDataType] | None = None,
     excluded_dtypes: Sequence[PolarsDataType] | None = None,
-) -> SearchStrategy[pli.Series]:
+) -> SearchStrategy[Series]:
     """
     Strategy for producing a polars Series.
 
@@ -385,7 +389,7 @@ def series(
     null_probability = float(null_probability or 0.0)
 
     @composite
-    def draw_series(draw: DrawFn) -> pli.Series:
+    def draw_series(draw: DrawFn) -> Series:
         with StringCache():
             # create/assign series dtype and retrieve matching strategy
             series_dtype = (
@@ -434,7 +438,7 @@ def series(
                         series_values[idx] = None
 
             # init series with strategy-generated data
-            s = pli.Series(
+            s = Series(
                 name=series_name,
                 dtype=series_dtype,
                 values=series_values,
@@ -465,7 +469,7 @@ def dataframes(
     allow_infinities: bool = True,
     allowed_dtypes: Sequence[PolarsDataType] | None = None,
     excluded_dtypes: Sequence[PolarsDataType] | None = None,
-) -> SearchStrategy[pli.DataFrame | pli.LazyFrame]:
+) -> SearchStrategy[DataFrame | LazyFrame]:
     """
     Provides a strategy for producing a DataFrame or LazyFrame.
 
@@ -559,8 +563,6 @@ def dataframes(
     │ 575050513 ┆ NaN        │
     └───────────┴────────────┘
     """  # noqa: 501
-    if isinstance(cols, int):
-        cols = columns(cols)
     if isinstance(min_size, int) and min_cols in (0, None):
         min_cols = 1
 
@@ -571,11 +573,11 @@ def dataframes(
     ]
 
     @composite
-    def draw_frames(draw: DrawFn) -> pli.DataFrame | pli.LazyFrame:
+    def draw_frames(draw: DrawFn) -> DataFrame | LazyFrame:
         with StringCache():
             # if not given, create 'n' cols with random dtypes
-            if cols is None:
-                n = between(
+            if cols is None or isinstance(cols, int):
+                n = cols or between(
                     draw, int, min_=(min_cols or 0), max_=(max_cols or MAX_COLS)
                 )
                 dtypes_ = [draw(sampled_from(selectable_dtypes)) for _ in range(n)]
@@ -583,7 +585,7 @@ def dataframes(
             elif isinstance(cols, column):
                 coldefs = [cols]
             else:
-                coldefs = list(cols)  # type: ignore[arg-type]
+                coldefs = list(cols)
 
             # append any explicitly provided cols
             coldefs.extend(include_cols or ())
@@ -610,7 +612,7 @@ def dataframes(
             frame_columns = [
                 c.name if (c.dtype is None) else (c.name, c.dtype) for c in coldefs
             ]
-            df = pli.DataFrame(
+            df = DataFrame(
                 data={
                     c.name: draw(
                         series(

@@ -4,6 +4,7 @@ import random
 import sys
 import typing
 from datetime import datetime, timedelta, timezone
+from itertools import permutations
 from typing import Any, cast
 
 if sys.version_info >= (3, 9):
@@ -24,9 +25,44 @@ from polars.datatypes import (
     INTEGER_DTYPES,
     NUMERIC_DTYPES,
     TEMPORAL_DTYPES,
-    PolarsDataType,
 )
 from polars.testing import assert_frame_equal, assert_series_equal
+
+
+def test_arg_true() -> None:
+    df = pl.DataFrame({"a": [1, 1, 2, 1]})
+    res = df.select((pl.col("a") == 1).arg_true())
+    expected = pl.DataFrame([pl.Series("a", [0, 1, 3], dtype=pl.UInt32)])
+    assert_frame_equal(res, expected)
+
+
+def test_col_select() -> None:
+    df = pl.DataFrame(
+        {
+            "ham": [1, 2, 3],
+            "hamburger": [11, 22, 33],
+            "foo": [3, 2, 1],
+            "bar": ["a", "b", "c"],
+        }
+    )
+
+    # Single column
+    assert df.select(pl.col("foo")).columns == ["foo"]
+    # Regex
+    assert df.select(pl.col("*")).columns == ["ham", "hamburger", "foo", "bar"]
+    assert df.select(pl.col("^ham.*$")).columns == ["ham", "hamburger"]
+    assert df.select(pl.col("*").exclude("ham")).columns == ["hamburger", "foo", "bar"]
+    # Multiple inputs
+    assert df.select(pl.col(["hamburger", "foo"])).columns == ["hamburger", "foo"]
+    assert df.select(pl.col("hamburger", "foo")).columns == ["hamburger", "foo"]
+    assert df.select(pl.col(pl.Series(["ham", "foo"]))).columns == ["ham", "foo"]
+    # Dtypes
+    assert df.select(pl.col(pl.Utf8)).columns == ["bar"]
+    assert df.select(pl.col(pl.Int64, pl.Float64)).columns == [
+        "ham",
+        "hamburger",
+        "foo",
+    ]
 
 
 def test_horizontal_agg(fruits_cars: pl.DataFrame) -> None:
@@ -42,6 +78,21 @@ def test_suffix(fruits_cars: pl.DataFrame) -> None:
     df = fruits_cars
     out = df.select([pl.all().suffix("_reverse")])
     assert out.columns == ["A_reverse", "fruits_reverse", "B_reverse", "cars_reverse"]
+
+
+def test_pipe() -> None:
+    df = pl.DataFrame({"foo": [1, 2, 3], "bar": [6, None, 8]})
+
+    def _multiply(expr: pl.Expr, mul: int) -> pl.Expr:
+        return expr * mul
+
+    result = df.select(
+        pl.col("foo").pipe(_multiply, mul=2),
+        pl.col("bar").pipe(_multiply, mul=3),
+    )
+
+    expected = pl.DataFrame({"foo": [2, 4, 6], "bar": [18, None, 24]})
+    assert_frame_equal(result, expected)
 
 
 def test_prefix(fruits_cars: pl.DataFrame) -> None:
@@ -104,19 +155,22 @@ def test_count_expr() -> None:
 
 
 def test_shuffle() -> None:
-    # Setting random.seed should lead to reproducible results
+    # setting 'random.seed' should lead to reproducible results
     s = pl.Series("a", range(20))
+    s_list = s.to_list()
+
     random.seed(1)
     result1 = pl.select(pl.lit(s).shuffle()).to_series()
+
     random.seed(1)
-    result2 = pl.select(pl.lit(s).shuffle()).to_series()
+    result2 = pl.select(a=pl.lit(s_list).shuffle()).to_series()
     assert_series_equal(result1, result2)
 
 
 def test_sample() -> None:
     a = pl.Series("a", range(0, 20))
     out = pl.select(
-        pl.lit(a).sample(frac=0.5, with_replacement=False, seed=1)
+        pl.lit(a).sample(fraction=0.5, with_replacement=False, seed=1)
     ).to_series()
 
     assert out.shape == (10,)
@@ -304,20 +358,23 @@ def test_power_by_expression() -> None:
         {"a": [1, None, None, 4, 5, 6], "b": [1, 2, None, 4, None, 6]}
     ).select(
         [
-            (pl.col("a") ** pl.col("b")).alias("pow"),
-            (2 ** pl.col("b")).alias("pow_left"),
+            pl.col("a").pow(pl.col("b")).alias("pow_expr"),
+            (pl.col("a") ** pl.col("b")).alias("pow_op"),
+            (2 ** pl.col("b")).alias("pow_op_left"),
         ]
     )
 
-    assert out["pow"].to_list() == [
-        1.0,
-        None,
-        None,
-        256.0,
-        None,
-        46656.0,
-    ]
-    assert out["pow_left"].to_list() == [
+    for pow_col in ("pow_expr", "pow_op"):
+        assert out[pow_col].to_list() == [
+            1.0,
+            None,
+            None,
+            256.0,
+            None,
+            46656.0,
+        ]
+
+    assert out["pow_op_left"].to_list() == [
         2.0,
         4.0,
         None,
@@ -403,6 +460,20 @@ def test_rank_so_4109() -> None:
     }
 
 
+def test_rank_random() -> None:
+    df = pl.from_dict(
+        {"a": [1] * 5, "b": [1, 2, 3, 4, 5], "c": [200, 100, 100, 50, 100]}
+    )
+
+    df_ranks1 = df.with_columns(
+        pl.col("c").rank(method="random", seed=1).over("a").alias("rank")
+    )
+    df_ranks2 = df.with_columns(
+        pl.col("c").rank(method="random", seed=1).over("a").alias("rank")
+    )
+    assert_frame_equal(df_ranks1, df_ranks2)
+
+
 def test_unique_empty() -> None:
     for dt in [pl.Utf8, pl.Boolean, pl.Int32, pl.UInt32]:
         s = pl.Series([], dtype=dt)
@@ -452,6 +523,14 @@ def test_logical_boolean() -> None:
     with pytest.raises(ValueError, match="ambiguous"):
         pl.col("colx") or pl.col("coly")
 
+    df = pl.DataFrame({"a": [1, 2, 3, 4, 5], "b": [1, 2, 3, 4, 5]})
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        df.select([(pl.col("a") > pl.col("b")) and (pl.col("b") > pl.col("b"))])
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        df.select([(pl.col("a") > pl.col("b")) or (pl.col("b") > pl.col("b"))])
+
 
 # https://github.com/pola-rs/polars/issues/4951
 def test_ewm_with_multiple_chunks() -> None:
@@ -491,84 +570,294 @@ def test_map_dict() -> None:
         None: "Not specified",
     }
     df = pl.DataFrame(
-        {
-            "country_code": ["FR", None, "ES", "DE"],
-        }
-    ).with_row_count()
+        [
+            pl.Series("int", [None, 1, None, 3], dtype=pl.Int16),
+            pl.Series("country_code", ["FR", None, "ES", "DE"], dtype=pl.Utf8),
+        ]
+    )
 
-    assert (
+    assert_frame_equal(
+        df.with_columns(
+            pl.col("country_code")
+            .map_dict(country_code_dict, default=pl.first())
+            .alias("remapped")
+        ),
+        pl.DataFrame(
+            [
+                pl.Series("int", [None, 1, None, 3], dtype=pl.Int16),
+                pl.Series("country_code", ["FR", None, "ES", "DE"], dtype=pl.Utf8),
+                pl.Series(
+                    "remapped",
+                    ["France", "Not specified", "ES", "Germany"],
+                    dtype=pl.Utf8,
+                ),
+            ]
+        ),
+    )
+
+    assert_frame_equal(
         df.with_columns(
             pl.col("country_code")
             .map_dict(country_code_dict, default=pl.col("country_code"))
             .alias("remapped")
-        )
-    ).to_dict(False) == {
-        "row_nr": [0, 1, 2, 3],
-        "country_code": ["FR", None, "ES", "DE"],
-        "remapped": ["France", "Not specified", "ES", "Germany"],
-    }
+        ),
+        pl.DataFrame(
+            [
+                pl.Series("int", [None, 1, None, 3], dtype=pl.Int16),
+                pl.Series("country_code", ["FR", None, "ES", "DE"], dtype=pl.Utf8),
+                pl.Series(
+                    "remapped",
+                    ["France", "Not specified", "ES", "Germany"],
+                    dtype=pl.Utf8,
+                ),
+            ]
+        ),
+    )
 
-    assert (
+    assert_frame_equal(
         df.with_columns(
             pl.col("country_code").map_dict(country_code_dict).alias("remapped")
-        )
-    ).to_dict(False) == {
-        "row_nr": [0, 1, 2, 3],
-        "country_code": ["FR", None, "ES", "DE"],
-        "remapped": ["France", "Not specified", None, "Germany"],
-    }
+        ),
+        pl.DataFrame(
+            [
+                pl.Series("int", [None, 1, None, 3], dtype=pl.Int16),
+                pl.Series("country_code", ["FR", None, "ES", "DE"], dtype=pl.Utf8),
+                pl.Series(
+                    "remapped",
+                    ["France", "Not specified", None, "Germany"],
+                    dtype=pl.Utf8,
+                ),
+            ]
+        ),
+    )
 
-    assert (
-        df.with_columns(
+    assert_frame_equal(
+        df.with_row_count().with_columns(
             pl.struct(pl.col(["country_code", "row_nr"]))
             .map_dict(
                 country_code_dict,
                 default=pl.col("row_nr").cast(pl.Utf8),
             )
             .alias("remapped")
-        )
-    ).to_dict(False) == {
-        "row_nr": [0, 1, 2, 3],
-        "country_code": ["FR", None, "ES", "DE"],
-        "remapped": ["France", "Not specified", "2", "Germany"],
-    }
+        ),
+        pl.DataFrame(
+            [
+                pl.Series("row_nr", [0, 1, 2, 3], dtype=pl.UInt32),
+                pl.Series("int", [None, 1, None, 3], dtype=pl.Int16),
+                pl.Series("country_code", ["FR", None, "ES", "DE"], dtype=pl.Utf8),
+                pl.Series(
+                    "remapped",
+                    ["France", "Not specified", "2", "Germany"],
+                    dtype=pl.Utf8,
+                ),
+            ]
+        ),
+    )
 
     with pl.StringCache():
-        assert (
+        assert_frame_equal(
             df.with_columns(
                 pl.col("country_code")
                 .cast(pl.Categorical)
                 .map_dict(country_code_dict, default=pl.col("country_code"))
                 .alias("remapped")
-            )
-        ).to_dict(False) == {
-            "row_nr": [0, 1, 2, 3],
-            "country_code": ["FR", None, "ES", "DE"],
-            "remapped": ["France", "Not specified", "ES", "Germany"],
-        }
+            ),
+            pl.DataFrame(
+                [
+                    pl.Series("int", [None, 1, None, 3], dtype=pl.Int16),
+                    pl.Series("country_code", ["FR", None, "ES", "DE"], dtype=pl.Utf8),
+                    pl.Series(
+                        "remapped",
+                        ["France", "Not specified", "ES", "Germany"],
+                        dtype=pl.Categorical,
+                    ),
+                ]
+            ),
+        )
 
     df_categorical_lazy = df.lazy().with_columns(
         pl.col("country_code").cast(pl.Categorical)
     )
 
     with pl.StringCache():
-        assert (
+        assert_frame_equal(
             df_categorical_lazy.with_columns(
                 pl.col("country_code")
                 .map_dict(country_code_dict, default=pl.col("country_code"))
                 .alias("remapped")
-            )
-            .collect()
-            .to_dict(False)
-        ) == {
-            "row_nr": [0, 1, 2, 3],
-            "country_code": ["FR", None, "ES", "DE"],
-            "remapped": ["France", "Not specified", "ES", "Germany"],
-        }
+            ).collect(),
+            pl.DataFrame(
+                [
+                    pl.Series("int", [None, 1, None, 3], dtype=pl.Int16),
+                    pl.Series(
+                        "country_code", ["FR", None, "ES", "DE"], dtype=pl.Categorical
+                    ),
+                    pl.Series(
+                        "remapped",
+                        ["France", "Not specified", "ES", "Germany"],
+                        dtype=pl.Categorical,
+                    ),
+                ]
+            ),
+        )
+
+    int_to_int_dict = {1: 5, 3: 7}
+
+    assert_frame_equal(
+        df.with_columns(pl.col("int").map_dict(int_to_int_dict).alias("remapped")),
+        pl.DataFrame(
+            [
+                pl.Series("int", [None, 1, None, 3], dtype=pl.Int16),
+                pl.Series("country_code", ["FR", None, "ES", "DE"], dtype=pl.Utf8),
+                pl.Series("remapped", [None, 5, None, 7], dtype=pl.Int16),
+            ]
+        ),
+    )
+
+    int_dict = {1: "b", 3: "d"}
+
+    assert_frame_equal(
+        df.with_columns(pl.col("int").map_dict(int_dict).alias("remapped")),
+        pl.DataFrame(
+            [
+                pl.Series("int", [None, 1, None, 3], dtype=pl.Int16),
+                pl.Series("country_code", ["FR", None, "ES", "DE"], dtype=pl.Utf8),
+                pl.Series("remapped", [None, "b", None, "d"], dtype=pl.Utf8),
+            ]
+        ),
+    )
+
+    int_with_none_dict = {1: "b", 3: "d", None: "e"}
+
+    assert_frame_equal(
+        df.with_columns(pl.col("int").map_dict(int_with_none_dict).alias("remapped")),
+        pl.DataFrame(
+            [
+                pl.Series("int", [None, 1, None, 3], dtype=pl.Int16),
+                pl.Series("country_code", ["FR", None, "ES", "DE"], dtype=pl.Utf8),
+                pl.Series("remapped", ["e", "b", "e", "d"], dtype=pl.Utf8),
+            ]
+        ),
+    )
+
+    int_with_only_none_values_dict = {3: None}
+
+    assert_frame_equal(
+        df.with_columns(
+            pl.col("int")
+            .map_dict(int_with_only_none_values_dict, default=6)
+            .alias("remapped")
+        ),
+        pl.DataFrame(
+            [
+                pl.Series("int", [None, 1, None, 3], dtype=pl.Int16),
+                pl.Series("country_code", ["FR", None, "ES", "DE"], dtype=pl.Utf8),
+                pl.Series("remapped", [6, 6, 6, None], dtype=pl.Int16),
+            ]
+        ),
+    )
+
+    assert_frame_equal(
+        df.with_columns(
+            pl.col("int")
+            .map_dict(int_with_only_none_values_dict, default=6, return_dtype=pl.Int32)
+            .alias("remapped")
+        ),
+        pl.DataFrame(
+            [
+                pl.Series("int", [None, 1, None, 3], dtype=pl.Int16),
+                pl.Series("country_code", ["FR", None, "ES", "DE"], dtype=pl.Utf8),
+                pl.Series("remapped", [6, 6, 6, None], dtype=pl.Int32),
+            ]
+        ),
+    )
+
+    assert_frame_equal(
+        df.with_columns(
+            pl.col("int").map_dict(int_with_only_none_values_dict).alias("remapped")
+        ),
+        pl.DataFrame(
+            [
+                pl.Series("int", [None, 1, None, 3], dtype=pl.Int16),
+                pl.Series("country_code", ["FR", None, "ES", "DE"], dtype=pl.Utf8),
+                pl.Series("remapped", [None, None, None, None], dtype=pl.Int16),
+            ]
+        ),
+    )
+
+    empty_dict: dict[Any, Any] = {}
+
+    assert_frame_equal(
+        df.with_columns(
+            pl.col("int").map_dict(empty_dict, default=pl.first()).alias("remapped")
+        ),
+        pl.DataFrame(
+            [
+                pl.Series("int", [None, 1, None, 3], dtype=pl.Int16),
+                pl.Series("country_code", ["FR", None, "ES", "DE"], dtype=pl.Utf8),
+                pl.Series("remapped", [None, 1, None, 3], dtype=pl.Int16),
+            ]
+        ),
+    )
+
+    float_dict = {1.0: "b", 3.0: "d"}
+
+    with pytest.raises(
+        pl.ComputeError,
+        match="Remapping keys for map_dict could not be converted to Int16: ",
+    ):
+        df.with_columns(pl.col("int").map_dict(float_dict))
+
+    df_int_as_str = df.with_columns(pl.col("int").cast(pl.Utf8))
+
+    with pytest.raises(
+        pl.ComputeError,
+        match="Remapping keys for map_dict could not be converted to Utf8 without losing values in the conversion.",
+    ):
+        df_int_as_str.with_columns(pl.col("int").map_dict(int_dict))
+
+    with pytest.raises(
+        pl.ComputeError,
+        match="Remapping keys for map_dict could not be converted to Utf8 without losing values in the conversion.",
+    ):
+        df_int_as_str.with_columns(pl.col("int").map_dict(int_with_none_dict))
+
+    # 7132
+    df = pl.DataFrame({"text": ["abc"]})
+    mapper = {"abc": "123"}
+    assert_frame_equal(
+        df.select(pl.col("text").map_dict(mapper).str.replace_all("1", "-")),
+        pl.DataFrame(
+            [
+                pl.Series("text", ["-23"], dtype=pl.Utf8),
+            ]
+        ),
+    )
+
+    assert_frame_equal(
+        pl.DataFrame(
+            [
+                pl.Series("float_to_boolean", [1.0, None]),
+                pl.Series("boolean_to_int", [True, False]),
+                pl.Series("boolean_to_str", [True, False]),
+            ]
+        ).with_columns(
+            pl.col("float_to_boolean").map_dict({1.0: True}),
+            pl.col("boolean_to_int").map_dict({True: 1, False: 0}),
+            pl.col("boolean_to_str").map_dict({True: "1", False: "0"}),
+        ),
+        pl.DataFrame(
+            [
+                pl.Series("float_to_boolean", [True, None], dtype=pl.Boolean),
+                pl.Series("boolean_to_int", [1, 0], dtype=pl.Int64),
+                pl.Series("boolean_to_str", ["1", "0"], dtype=pl.Utf8),
+            ]
+        ),
+    )
 
 
 def test_lit_dtypes() -> None:
-    def lit_series(value: Any, dtype: PolarsDataType | None) -> pl.Series:
+    def lit_series(value: Any, dtype: pl.PolarsDataType | None) -> pl.Series:
         return pl.select(pl.lit(value, dtype=dtype)).to_series()
 
     d = datetime(2049, 10, 5, 1, 2, 3, 987654)
@@ -593,6 +882,8 @@ def test_lit_dtypes() -> None:
             "f32": lit_series(0, pl.Float32),
             "u16": lit_series(0, pl.UInt16),
             "i16": lit_series(0, pl.Int16),
+            "i64": lit_series([8], None),
+            "list_i64": lit_series([[1, 2, 3]], None),
         }
     )
     assert df.dtypes == [
@@ -609,8 +900,26 @@ def test_lit_dtypes() -> None:
         pl.Float32,
         pl.UInt16,
         pl.Int16,
+        pl.Int64,
+        pl.List(pl.Int64),
     ]
-    assert df.row(0) == (d_ms, d, d, d_tz, d_tz, d_tz, d_tz, td_ms, td, td, 0, 0, 0)
+    assert df.row(0) == (
+        d_ms,
+        d,
+        d,
+        d_tz,
+        d_tz,
+        d_tz,
+        d_tz,
+        td_ms,
+        td,
+        td,
+        0,
+        0,
+        0,
+        8,
+        [1, 2, 3],
+    )
 
 
 def test_incompatible_lit_dtype() -> None:
@@ -642,3 +951,102 @@ def test_exclude_invalid_input(input: tuple[Any, ...]) -> None:
     df = pl.DataFrame(schema=["a", "b", "c"])
     with pytest.raises(TypeError):
         df.select(pl.all().exclude(*input))
+
+
+def test_operators_vs_expressions() -> None:
+    df = pl.DataFrame(
+        data={
+            "x": [5, 6, 7, 4, 8],
+            "y": [1.5, 2.5, 1.0, 4.0, -5.75],
+            "z": [-9, 2, -1, 4, 8],
+        }
+    )
+    for c1, c2 in permutations("xyz", r=2):
+        df_op = df.select(
+            a=pl.col(c1) == pl.col(c2),
+            b=pl.col(c1) // pl.col(c2),
+            c=pl.col(c1) > pl.col(c2),
+            d=pl.col(c1) >= pl.col(c2),
+            e=pl.col(c1) < pl.col(c2),
+            f=pl.col(c1) <= pl.col(c2),
+            g=pl.col(c1) % pl.col(c2),
+            h=pl.col(c1) != pl.col(c2),
+            i=pl.col(c1) - pl.col(c2),
+            j=pl.col(c1) / pl.col(c2),
+            k=pl.col(c1) * pl.col(c2),
+            l=pl.col(c1) + pl.col(c2),
+        )
+        df_expr = df.select(
+            a=pl.col(c1).eq(pl.col(c2)),
+            b=pl.col(c1).floordiv(pl.col(c2)),
+            c=pl.col(c1).gt(pl.col(c2)),
+            d=pl.col(c1).ge(pl.col(c2)),
+            e=pl.col(c1).lt(pl.col(c2)),
+            f=pl.col(c1).le(pl.col(c2)),
+            g=pl.col(c1).mod(pl.col(c2)),
+            h=pl.col(c1).ne(pl.col(c2)),
+            i=pl.col(c1).sub(pl.col(c2)),
+            j=pl.col(c1).truediv(pl.col(c2)),
+            k=pl.col(c1).mul(pl.col(c2)),
+            l=pl.col(c1).add(pl.col(c2)),
+        )
+        assert_frame_equal(df_op, df_expr)
+
+    # xor - only int cols
+    assert_frame_equal(
+        df.select(pl.col("x") ^ pl.col("z")),
+        df.select(pl.col("x").xor(pl.col("z"))),
+    )
+
+    # and (&) or (|) chains
+    assert_frame_equal(
+        df.select(
+            all=(pl.col("x") >= pl.col("z")).and_(
+                pl.col("y") >= pl.col("z"),
+                pl.col("y") == pl.col("y"),
+                pl.col("z") <= pl.col("x"),
+                pl.col("y") != pl.col("x"),
+            )
+        ),
+        df.select(
+            all=(
+                (pl.col("x") >= pl.col("z"))
+                & (pl.col("y") >= pl.col("z"))
+                & (pl.col("y") == pl.col("y"))
+                & (pl.col("z") <= pl.col("x"))
+                & (pl.col("y") != pl.col("x"))
+            )
+        ),
+    )
+
+    assert_frame_equal(
+        df.select(
+            any=(pl.col("x") == pl.col("y")).or_(
+                pl.col("x") == pl.col("y"),
+                pl.col("y") == pl.col("z"),
+                pl.col("y").cast(int) == pl.col("z"),
+            )
+        ),
+        df.select(
+            any=(pl.col("x") == pl.col("y"))
+            | (pl.col("x") == pl.col("y"))
+            | (pl.col("y") == pl.col("z"))
+            | (pl.col("y").cast(int) == pl.col("z"))
+        ),
+    )
+
+
+def test_head() -> None:
+    df = pl.DataFrame({"a": [1, 2, 3, 4, 5]})
+    assert df.select(pl.col("a").head(0)).to_dict(False) == {"a": []}
+    assert df.select(pl.col("a").head(3)).to_dict(False) == {"a": [1, 2, 3]}
+    assert df.select(pl.col("a").head(10)).to_dict(False) == {"a": [1, 2, 3, 4, 5]}
+    assert df.select(pl.col("a").head(pl.count() / 2)).to_dict(False) == {"a": [1, 2]}
+
+
+def test_tail() -> None:
+    df = pl.DataFrame({"a": [1, 2, 3, 4, 5]})
+    assert df.select(pl.col("a").tail(0)).to_dict(False) == {"a": []}
+    assert df.select(pl.col("a").tail(3)).to_dict(False) == {"a": [3, 4, 5]}
+    assert df.select(pl.col("a").tail(10)).to_dict(False) == {"a": [1, 2, 3, 4, 5]}
+    assert df.select(pl.col("a").tail(pl.count() / 2)).to_dict(False) == {"a": [4, 5]}

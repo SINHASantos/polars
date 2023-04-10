@@ -8,7 +8,7 @@ use std::ops::Add;
 use arrow::compute;
 use arrow::types::simd::Simd;
 use arrow::types::NativeType;
-use num::{Float, ToPrimitive};
+use num_traits::{Float, ToPrimitive};
 use polars_arrow::kernels::rolling::{compare_fn_nan_max, compare_fn_nan_min};
 pub use quantile::*;
 pub use var::*;
@@ -172,34 +172,47 @@ where
             _ => {
                 let null_count = self.null_count();
                 let len = self.len();
-                if null_count == len {
-                    None
-                } else {
-                    let mut acc = 0.0;
-                    let len = (len - null_count) as f64;
+                match null_count {
+                    nc if nc == len => None,
+                    #[cfg(feature = "simd")]
+                    _ => {
+                        // TODO: investigate if we need a stable mean
+                        // because of SIMD memory locations and associativity.
+                        // similar to sum
+                        let mut sum = 0.0;
+                        for arr in self.downcast_iter() {
+                            sum += polars_arrow::kernels::agg_mean::sum_as_f64(arr);
+                        }
+                        Some(sum / (len - null_count) as f64)
+                    }
+                    #[cfg(not(feature = "simd"))]
+                    _ => {
+                        let mut acc = 0.0;
+                        let len = (len - null_count) as f64;
 
-                    for arr in self.downcast_iter() {
-                        if arr.null_count() > 0 {
-                            for v in arr.into_iter().flatten() {
-                                // safety
-                                // all these types can be coerced to f64
-                                unsafe {
-                                    let val = v.to_f64().unwrap_unchecked();
-                                    acc += val
+                        for arr in self.downcast_iter() {
+                            if arr.null_count() > 0 {
+                                for v in arr.into_iter().flatten() {
+                                    // safety
+                                    // all these types can be coerced to f64
+                                    unsafe {
+                                        let val = v.to_f64().unwrap_unchecked();
+                                        acc += val
+                                    }
                                 }
-                            }
-                        } else {
-                            for v in arr.values().as_slice() {
-                                // safety
-                                // all these types can be coerced to f64
-                                unsafe {
-                                    let val = v.to_f64().unwrap_unchecked();
-                                    acc += val
+                            } else {
+                                for v in arr.values().as_slice() {
+                                    // safety
+                                    // all these types can be coerced to f64
+                                    unsafe {
+                                        let val = v.to_f64().unwrap_unchecked();
+                                        acc += val
+                                    }
                                 }
                             }
                         }
+                        Some(acc / len)
                     }
-                    Some(acc / len)
                 }
             }
         }
@@ -207,9 +220,9 @@ where
 }
 
 /// Booleans are casted to 1 or 0.
-impl ChunkAgg<IdxSize> for BooleanChunked {
+impl BooleanChunked {
     /// Returns `None` if the array is empty or only contains null values.
-    fn sum(&self) -> Option<IdxSize> {
+    pub fn sum(&self) -> Option<IdxSize> {
         if self.is_empty() {
             None
         } else {
@@ -226,28 +239,39 @@ impl ChunkAgg<IdxSize> for BooleanChunked {
         }
     }
 
-    fn min(&self) -> Option<IdxSize> {
-        if self.is_empty() {
+    pub fn min(&self) -> Option<bool> {
+        let nc = self.null_count();
+        let len = self.len();
+        if self.is_empty() || nc == len {
             return None;
         }
-        if self.all() {
-            Some(1)
+        if nc == 0 {
+            if self.all() {
+                Some(true)
+            } else {
+                Some(false)
+            }
         } else {
-            Some(0)
+            // we can unwrap as we already checked empty and all null above
+            if (self.sum().unwrap() + nc as IdxSize) == len as IdxSize {
+                Some(true)
+            } else {
+                Some(false)
+            }
         }
     }
 
-    fn max(&self) -> Option<IdxSize> {
-        if self.is_empty() {
+    pub fn max(&self) -> Option<bool> {
+        if self.is_empty() || self.null_count() == self.len() {
             return None;
         }
         if self.any() {
-            Some(1)
+            Some(true)
         } else {
-            Some(0)
+            Some(false)
         }
     }
-    fn mean(&self) -> Option<f64> {
+    pub fn mean(&self) -> Option<f64> {
         self.sum()
             .map(|sum| sum as f64 / (self.len() - self.null_count()) as f64)
     }
@@ -405,22 +429,16 @@ impl QuantileAggSeries for Float64Chunked {
 
 impl ChunkAggSeries for BooleanChunked {
     fn sum_as_series(&self) -> Series {
-        let v = ChunkAgg::sum(self);
-        let mut ca: IdxCa = [v].iter().copied().collect();
-        ca.rename(self.name());
-        ca.into_series()
+        let v = self.sum();
+        Series::new(self.name(), [v])
     }
     fn max_as_series(&self) -> Series {
-        let v = ChunkAgg::max(self);
-        let mut ca: IdxCa = [v].iter().copied().collect();
-        ca.rename(self.name());
-        ca.into_series()
+        let v = self.max();
+        Series::new(self.name(), [v])
     }
     fn min_as_series(&self) -> Series {
-        let v = ChunkAgg::min(self);
-        let mut ca: IdxCa = [v].iter().copied().collect();
-        ca.rename(self.name());
-        ca.into_series()
+        let v = self.min();
+        Series::new(self.name(), [v])
     }
 }
 
@@ -459,7 +477,6 @@ impl ChunkAggSeries for Utf8Chunked {
     }
 }
 
-#[cfg(feature = "dtype-binary")]
 impl ChunkAggSeries for BinaryChunked {
     fn sum_as_series(&self) -> Series {
         BinaryChunked::full_null(self.name(), 1).into_series()
@@ -570,34 +587,10 @@ mod test {
         let ca = Float32Chunked::from_slice(
             "",
             &[
-                0.166189,
-                0.166559,
-                0.168517,
-                0.169393,
-                0.175272,
-                0.23316699999999999,
-                0.238787,
-                0.266562,
-                0.26903,
-                0.285792,
-                0.292801,
-                0.29342899999999994,
-                0.30170600000000003,
-                0.308534,
-                0.331489,
-                0.346095,
-                0.36764399999999997,
-                0.36993899999999996,
-                0.37207399999999996,
-                0.41014000000000006,
-                0.415789,
-                0.421781,
-                0.4277250000000001,
-                0.46536299999999997,
-                0.500208,
-                2.6217269999999995,
-                2.803311,
-                3.868526,
+                0.166189, 0.166559, 0.168517, 0.169393, 0.175272, 0.233167, 0.238787, 0.266562,
+                0.26903, 0.285792, 0.292801, 0.293429, 0.301706, 0.308534, 0.331489, 0.346095,
+                0.367644, 0.369939, 0.372074, 0.41014, 0.415789, 0.421781, 0.427725, 0.465363,
+                0.500208, 2.621727, 2.803311, 3.868526,
             ],
         );
         assert!((ca.median().unwrap() - 0.3200115).abs() < 0.0001)
@@ -878,34 +871,10 @@ mod test {
         let ca = Float32Chunked::from_slice(
             "",
             &[
-                0.166189,
-                0.166559,
-                0.168517,
-                0.169393,
-                0.175272,
-                0.23316699999999999,
-                0.238787,
-                0.266562,
-                0.26903,
-                0.285792,
-                0.292801,
-                0.29342899999999994,
-                0.30170600000000003,
-                0.308534,
-                0.331489,
-                0.346095,
-                0.36764399999999997,
-                0.36993899999999996,
-                0.37207399999999996,
-                0.41014000000000006,
-                0.415789,
-                0.421781,
-                0.4277250000000001,
-                0.46536299999999997,
-                0.500208,
-                2.6217269999999995,
-                2.803311,
-                3.868526,
+                0.166189, 0.166559, 0.168517, 0.169393, 0.175272, 0.233167, 0.238787, 0.266562,
+                0.26903, 0.285792, 0.292801, 0.293429, 0.301706, 0.308534, 0.331489, 0.346095,
+                0.367644, 0.369939, 0.372074, 0.41014, 0.415789, 0.421781, 0.427725, 0.465363,
+                0.500208, 2.621727, 2.803311, 3.868526,
             ],
         );
 

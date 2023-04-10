@@ -29,38 +29,19 @@ where
     T::Native: Hash + Eq + Send + AsU64,
     Option<T::Native>: AsU64,
 {
-    // set group size hint
-    #[cfg(feature = "dtype-categorical")]
-    let group_size_hint = if let DataType::Categorical(Some(m)) = ca.dtype() {
-        ca.len() / m.len()
-    } else {
-        0
-    };
-    #[cfg(not(feature = "dtype-categorical"))]
-    let group_size_hint = 0;
-
     if multithreaded && group_multithreaded(ca) {
         let n_partitions = _set_partition_size() as u64;
 
         // use the arrays as iterators
-        if ca.chunks.len() == 1 {
-            if !ca.has_validity() {
-                let keys = vec![ca.cont_slice().unwrap()];
-                groupby_threaded_num(keys, group_size_hint, n_partitions, sorted)
-            } else {
-                let keys = ca
-                    .downcast_iter()
-                    .map(|arr| arr.into_iter().map(|x| x.copied()).collect::<Vec<_>>())
-                    .collect::<Vec<_>>();
-                groupby_threaded_num(keys, group_size_hint, n_partitions, sorted)
-            }
-            // use the polars-iterators
-        } else if !ca.has_validity() {
-            let keys = vec![ca.into_no_null_iter().collect::<Vec<_>>()];
-            groupby_threaded_num(keys, group_size_hint, n_partitions, sorted)
+        if ca.null_count() == 0 {
+            let keys = ca
+                .downcast_iter()
+                .map(|arr| arr.values().as_slice())
+                .collect::<Vec<_>>();
+            groupby_threaded_num2(&keys, n_partitions, sorted)
         } else {
-            let keys = vec![ca.into_iter().collect::<Vec<_>>()];
-            groupby_threaded_num(keys, group_size_hint, n_partitions, sorted)
+            let keys = ca.downcast_iter().collect::<Vec<_>>();
+            groupby_threaded_num2(&keys, n_partitions, sorted)
         }
     } else if !ca.has_validity() {
         groupby(ca.into_no_null_iter(), sorted)
@@ -146,6 +127,13 @@ where
     }
 }
 
+#[cfg(all(feature = "dtype-categorical", feature = "performant"))]
+impl IntoGroupsProxy for CategoricalChunked {
+    fn group_tuples(&self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
+        Ok(self.group_tuples_perfect(multithreaded, sorted))
+    }
+}
+
 impl<T> IntoGroupsProxy for ChunkedArray<T>
 where
     T: PolarsNumericType,
@@ -153,12 +141,10 @@ where
 {
     fn group_tuples(&self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
         // sorted path
-        if self.is_sorted_ascending_flag()
-            || self.is_sorted_descending_flag() && self.chunks().len() == 1
-        {
+        if self.is_sorted_ascending_flag() || self.is_sorted_descending_flag() {
             // don't have to pass `sorted` arg, GroupSlice is always sorted.
             return Ok(GroupsProxy::Slice {
-                groups: self.create_groups_from_sorted(multithreaded),
+                groups: self.rechunk().create_groups_from_sorted(multithreaded),
                 rolling: false,
             });
         }
@@ -218,7 +204,7 @@ where
                 num_groups_proxy(ca, multithreaded, sorted)
             }
             _ => {
-                let ca = self.cast_unchecked(&DataType::UInt32).unwrap();
+                let ca = unsafe { self.cast_unchecked(&DataType::UInt32).unwrap() };
                 let ca = ca.u32().unwrap();
                 num_groups_proxy(ca, multithreaded, sorted)
             }
@@ -246,56 +232,10 @@ impl IntoGroupsProxy for BooleanChunked {
 impl IntoGroupsProxy for Utf8Chunked {
     #[allow(clippy::needless_lifetimes)]
     fn group_tuples<'a>(&'a self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
-        let hb = RandomState::default();
-        let null_h = get_null_hash_value(hb.clone());
-
-        let out = if multithreaded {
-            let n_partitions = _set_partition_size();
-
-            let split = _split_offsets(self.len(), n_partitions);
-
-            let str_hashes = POOL.install(|| {
-                split
-                    .into_par_iter()
-                    .map(|(offset, len)| {
-                        let ca = self.slice(offset as i64, len);
-                        ca.into_iter()
-                            .map(|opt_s| {
-                                let hash = match opt_s {
-                                    Some(s) => hb.hash_single(s),
-                                    None => null_h,
-                                };
-                                // Safety:
-                                // the underlying data is tied to self
-                                unsafe {
-                                    std::mem::transmute::<BytesHash<'_>, BytesHash<'a>>(
-                                        BytesHash::new_from_str(opt_s, hash),
-                                    )
-                                }
-                            })
-                            .collect_trusted::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>()
-            });
-            groupby_threaded_num(str_hashes, 0, n_partitions as u64, sorted)
-        } else {
-            let str_hashes = self
-                .into_iter()
-                .map(|opt_s| {
-                    let hash = match opt_s {
-                        Some(s) => hb.hash_single(s),
-                        None => null_h,
-                    };
-                    BytesHash::new_from_str(opt_s, hash)
-                })
-                .collect_trusted::<Vec<_>>();
-            groupby(str_hashes.iter(), sorted)
-        };
-        Ok(out)
+        self.as_binary().group_tuples(multithreaded, sorted)
     }
 }
 
-#[cfg(feature = "dtype-binary")]
 impl IntoGroupsProxy for BinaryChunked {
     #[allow(clippy::needless_lifetimes)]
     fn group_tuples<'a>(&'a self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
@@ -330,7 +270,8 @@ impl IntoGroupsProxy for BinaryChunked {
                     })
                     .collect::<Vec<_>>()
             });
-            groupby_threaded_num(byte_hashes, 0, n_partitions as u64, sorted)
+            let byte_hashes = byte_hashes.iter().collect::<Vec<_>>();
+            groupby_threaded_num2(&byte_hashes, n_partitions as u64, sorted)
         } else {
             let byte_hashes = self
                 .into_iter()
@@ -354,11 +295,10 @@ impl IntoGroupsProxy for ListChunked {
     fn group_tuples<'a>(&'a self, multithreaded: bool, sorted: bool) -> PolarsResult<GroupsProxy> {
         #[cfg(feature = "groupby_list")]
         {
-            if !self.inner_dtype().to_physical().is_numeric() {
-                return Err(PolarsError::ComputeError(
-                    "Grouping on List type is only allowed if the inner type is numeric".into(),
-                ));
-            }
+            polars_ensure!(
+                self.inner_dtype().to_physical().is_numeric(),
+                ComputeError: "grouping on list type is only allowed if the inner type is numeric"
+            );
 
             let hb = RandomState::default();
             let null_h = get_null_hash_value(hb.clone());
@@ -397,9 +337,9 @@ impl IntoGroupsProxy for ListChunked {
                             arr_to_hashes(&ca)
                         })
                         .collect::<PolarsResult<Vec<_>>>()?;
-                    Ok(groupby_threaded_num(
-                        bytes_hashes,
-                        0,
+                    let bytes_hashes = bytes_hashes.iter().collect::<Vec<_>>();
+                    Ok(groupby_threaded_num2(
+                        &bytes_hashes,
                         n_partitions as u64,
                         sorted,
                     ))

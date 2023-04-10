@@ -22,12 +22,12 @@ def test_dtype_init_equivalence() -> None:
 
 def test_dtype_temporal_units() -> None:
     # check (in)equality behaviour of temporal types that take units
-    for tu in datatypes.DTYPE_TEMPORAL_UNITS:
-        assert pl.Datetime == pl.Datetime(tu)
-        assert pl.Duration == pl.Duration(tu)
+    for time_unit in datatypes.DTYPE_TEMPORAL_UNITS:
+        assert pl.Datetime == pl.Datetime(time_unit)
+        assert pl.Duration == pl.Duration(time_unit)
 
-        assert pl.Datetime(tu) == pl.Datetime()
-        assert pl.Duration(tu) == pl.Duration()
+        assert pl.Datetime(time_unit) == pl.Datetime()
+        assert pl.Duration(time_unit) == pl.Duration()
 
     assert pl.Datetime("ms") != pl.Datetime("ns")
     assert pl.Duration("ns") != pl.Duration("us")
@@ -38,11 +38,28 @@ def test_dtype_temporal_units() -> None:
         (datatypes.py_type_to_dtype(timedelta), pl.Duration),
     ):
         assert inferred_dtype == expected_dtype
-        assert inferred_dtype.tu == "us"  # type: ignore[union-attr]
+        assert inferred_dtype.time_unit == "us"  # type: ignore[union-attr]
+
+    with pytest.raises(ValueError, match="Invalid time_unit"):
+        pl.Datetime("?")  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="Invalid time_unit"):
+        pl.Duration("?")  # type: ignore[arg-type]
 
 
-def test_get_idx_type() -> None:
-    assert datatypes.get_idx_type() == datatypes.UInt32
+def test_dtype_base_type() -> None:
+    assert pl.Date.base_type() is pl.Date
+    assert pl.List(pl.Int32).base_type() is pl.List
+    assert (
+        pl.Struct([pl.Field("a", pl.Int64), pl.Field("b", pl.Boolean)]).base_type()
+        is pl.Struct
+    )
+    for dtype in pl.DATETIME_DTYPES:
+        assert dtype.base_type() is pl.Datetime
+
+
+def test_get_index_type() -> None:
+    assert pl.get_index_type() == pl.UInt32
 
 
 def test_dtypes_picklable() -> None:
@@ -73,10 +90,10 @@ def test_dtypes_hashable() -> None:
         (pl.Datetime, "Datetime"),
         (
             pl.Datetime(time_zone="Europe/Amsterdam"),
-            "Datetime(tu='us', tz='Europe/Amsterdam')",
+            "Datetime(time_unit='us', time_zone='Europe/Amsterdam')",
         ),
         (pl.List(pl.Int8), "List(Int8)"),
-        (pl.List(pl.Duration(time_unit="ns")), "List(Duration(tu='ns'))"),
+        (pl.List(pl.Duration(time_unit="ns")), "List(Duration(time_unit='ns'))"),
         (pl.Struct, "Struct"),
         (
             pl.Struct({"name": pl.Utf8, "ids": pl.List(pl.UInt32)}),

@@ -36,11 +36,6 @@ def test_fill_null_minimal_upcast_4056() -> None:
     assert df.with_columns(pl.col(pl.Int8).fill_null(-1000)).dtypes[0] == pl.Int32
 
 
-def test_with_column_duplicates() -> None:
-    df = pl.DataFrame({"a": [0, None, 2, 3, None], "b": [None, 1, 2, 3, None]})
-    assert df.with_columns([pl.all().alias("same")]).columns == ["a", "b", "same"]
-
-
 def test_pow_dtype() -> None:
     df = pl.DataFrame(
         {
@@ -302,7 +297,7 @@ def test_all_null_cast_5826() -> None:
     assert out.item() is None
 
 
-def test_emtpy_list_eval_schema_5734() -> None:
+def test_empty_list_eval_schema_5734() -> None:
     df = pl.DataFrame({"a": [[{"b": 1, "c": 2}]]})
     assert df.filter(False).select(
         pl.col("a").arr.eval(pl.element().struct.field("b"))
@@ -350,7 +345,7 @@ def test_from_dicts_empty() -> None:
         pl.from_dicts([])
 
 
-def test_duration_divison_schema() -> None:
+def test_duration_division_schema() -> None:
     df = pl.DataFrame({"a": [1]})
     q = (
         df.lazy()
@@ -370,3 +365,17 @@ def test_int_operator_stability() -> None:
         assert pl.select(pl.lit(s) - 2).dtypes == [dt]
         assert pl.select(pl.lit(s) * 2).dtypes == [dt]
         assert pl.select(pl.lit(s) / 2).dtypes == [pl.Float64]
+
+
+def test_deep_subexpression_f32_schema_7129() -> None:
+    df = pl.DataFrame({"a": [1.1, 2.3, 3.4, 4.5]}, schema={"a": pl.Float32()})
+    assert df.with_columns(pl.col("a") - pl.col("a").median()).dtypes == [pl.Float32]
+    assert df.with_columns(
+        (pl.col("a") - pl.col("a").mean()) / (pl.col("a").std() + 0.001)
+    ).dtypes == [pl.Float32]
+
+
+def test_bool_sum_schema() -> None:
+    assert pl.LazyFrame({"a": [True, False]}).select(pl.col("a").sum()).schema == {
+        "a": pl.UInt32
+    }

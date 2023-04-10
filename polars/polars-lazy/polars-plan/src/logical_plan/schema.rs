@@ -1,8 +1,51 @@
+use std::borrow::Cow;
+
 use polars_core::prelude::*;
+use polars_utils::format_smartstring;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::prelude::*;
+
+impl LogicalPlan {
+    pub fn schema(&self) -> PolarsResult<Cow<'_, SchemaRef>> {
+        use LogicalPlan::*;
+        match self {
+            #[cfg(feature = "python")]
+            PythonScan { options } => Ok(Cow::Borrowed(&options.schema)),
+            Union { inputs, .. } => inputs[0].schema(),
+            Cache { input, .. } => input.schema(),
+            Sort { input, .. } => input.schema(),
+            #[cfg(feature = "parquet")]
+            ParquetScan { file_info, .. } => Ok(Cow::Borrowed(&file_info.schema)),
+            #[cfg(feature = "ipc")]
+            IpcScan { file_info, .. } => Ok(Cow::Borrowed(&file_info.schema)),
+            DataFrameScan { schema, .. } => Ok(Cow::Borrowed(schema)),
+            AnonymousScan { file_info, .. } => Ok(Cow::Borrowed(&file_info.schema)),
+            Selection { input, .. } => input.schema(),
+            #[cfg(feature = "csv-file")]
+            CsvScan { file_info, .. } => Ok(Cow::Borrowed(&file_info.schema)),
+            Projection { schema, .. } => Ok(Cow::Borrowed(schema)),
+            LocalProjection { schema, .. } => Ok(Cow::Borrowed(schema)),
+            Aggregate { schema, .. } => Ok(Cow::Borrowed(schema)),
+            Join { schema, .. } => Ok(Cow::Borrowed(schema)),
+            HStack { schema, .. } => Ok(Cow::Borrowed(schema)),
+            Distinct { input, .. } | FileSink { input, .. } => input.schema(),
+            Slice { input, .. } => input.schema(),
+            MapFunction {
+                input, function, ..
+            } => {
+                let input_schema = input.schema()?;
+                match input_schema {
+                    Cow::Owned(schema) => Ok(Cow::Owned(function.schema(&schema)?.into_owned())),
+                    Cow::Borrowed(schema) => function.schema(schema),
+                }
+            }
+            Error { err, .. } => Err(err.take()),
+            ExtContext { schema, .. } => Ok(Cow::Borrowed(schema)),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -197,7 +240,7 @@ pub(crate) fn det_join_schema(
 
             for (name, dtype) in schema_left.iter() {
                 names.insert(name.as_str());
-                new_schema.with_column(name.to_string(), dtype.clone());
+                new_schema.with_column(name.clone(), dtype.clone());
             }
 
             // make sure that expression are assigned to the schema
@@ -224,7 +267,8 @@ pub(crate) fn det_join_schema(
                         if schema_left.contains(&field_right.name) {
                             use polars_core::frame::hash_join::_join_suffix_name;
                             new_schema.with_column(
-                                _join_suffix_name(&field_right.name, options.suffix.as_ref()),
+                                _join_suffix_name(&field_right.name, options.suffix.as_ref())
+                                    .into(),
                                 field_right.dtype,
                             );
                         } else {
@@ -257,10 +301,10 @@ pub(crate) fn det_join_schema(
                             }
                         }
 
-                        let new_name = format!("{}{}", name, options.suffix.as_ref());
+                        let new_name = format_smartstring!("{}{}", name, options.suffix.as_ref());
                         new_schema.with_column(new_name, dtype.clone());
                     } else {
-                        new_schema.with_column(name.to_string(), dtype.clone());
+                        new_schema.with_column(name.clone(), dtype.clone());
                     }
                 }
             }

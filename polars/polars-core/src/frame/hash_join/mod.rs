@@ -1,5 +1,5 @@
 pub(crate) mod multiple_keys;
-mod single_keys;
+pub(super) mod single_keys;
 mod single_keys_dispatch;
 mod single_keys_inner;
 mod single_keys_left;
@@ -22,10 +22,8 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "asof_join")]
 pub(crate) use single_keys::create_probe_table;
-use single_keys::*;
 #[cfg(feature = "asof_join")]
-pub(crate) use single_keys_dispatch::prepare_strs;
-use single_keys_inner::*;
+pub(crate) use single_keys_dispatch::prepare_bytes;
 use single_keys_left::*;
 use single_keys_outer::*;
 #[cfg(feature = "semi_anti_join")]
@@ -43,12 +41,12 @@ pub use crate::frame::hash_join::multiple_keys::{
 pub use crate::frame::hash_join::multiple_keys::{
     _left_anti_multiple_keys, _left_semi_multiple_keys,
 };
-use crate::prelude::*;
-use crate::utils::{_set_partition_size, slice_slice, split_ca};
-use crate::vector_hasher::{
+use crate::hashing::{
     create_hash_and_keys_threaded_vectorized, prepare_hashed_relation_threaded, this_partition,
     AsU64, BytesHash,
 };
+use crate::prelude::*;
+use crate::utils::{_set_partition_size, slice_slice, split_ca};
 use crate::POOL;
 
 pub type LeftJoinIds = (JoinIds, JoinOptIds);
@@ -106,16 +104,14 @@ use crate::series::IsSorted;
 /// a different global string cache the mapping will be incorrect.
 #[cfg(feature = "dtype-categorical")]
 pub fn _check_categorical_src(l: &DataType, r: &DataType) -> PolarsResult<()> {
-    match (l, r) {
-        (DataType::Categorical(Some(l)), DataType::Categorical(Some(r))) => {
-            if !l.same_src(r) {
-                return Err(PolarsError::ComputeError("Joins/or comparisons on categorical dtypes can only happen if they are created under the same global string cache.\
-                  Hint: set a global StringCache".into()));
-            }
-            Ok(())
-        }
-        _ => Ok(()),
+    if let (DataType::Categorical(Some(l)), DataType::Categorical(Some(r))) = (l, r) {
+        polars_ensure!(
+            l.same_src(r),
+            ComputeError: "joins/or comparisons on categoricals can only happen if they were \
+            created under the same global string cache"
+        );
     }
+    Ok(())
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -260,7 +256,6 @@ macro_rules! impl_zip_outer_join {
 }
 impl_zip_outer_join!(BooleanChunked);
 impl_zip_outer_join!(Utf8Chunked);
-#[cfg(feature = "dtype-binary")]
 impl_zip_outer_join!(BinaryChunked);
 
 impl ZipOuterJoinColumn for Float32Chunked {
@@ -576,7 +571,7 @@ impl DataFrame {
             _ => s,
         };
 
-        df_left.get_columns_mut().insert(join_column_index, s);
+        unsafe { df_left.get_columns_mut().insert(join_column_index, s) };
         _finish_join(df_left, df_right, suffix.as_deref())
     }
 }

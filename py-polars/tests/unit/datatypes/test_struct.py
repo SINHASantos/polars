@@ -81,6 +81,19 @@ def test_struct_unnesting() -> None:
     assert_frame_equal(out, expected)
 
 
+def test_struct_unnest_multiple() -> None:
+    df = pl.DataFrame({"a": [1, 2], "b": [3, 4], "c": [1.0, 2.0], "d": ["a", "b"]})
+    df_structs = df.select(s1=pl.struct(["a", "b"]), s2=pl.struct(["c", "d"]))
+
+    # List input
+    result = df_structs.unnest(["s1", "s2"])
+    assert_frame_equal(result, df)
+
+    # Positional input
+    result = df_structs.unnest("s1", "s2")
+    assert_frame_equal(result, df)
+
+
 def test_struct_function_expansion() -> None:
     df = pl.DataFrame(
         {"a": [1, 2, 3, 4], "b": ["one", "two", "three", "four"], "c": [9, 8, 7, 6]}
@@ -492,16 +505,16 @@ def test_struct_schema_on_append_extend_3452() -> None:
     with pytest.raises(
         pl.SchemaError,
         match=(
-            "cannot append field with name: address to struct with field name: city,"
-            " please check your schema"
+            'cannot append field with name "address" '
+            'to struct with field name "city"'
         ),
     ):
         housing1.append(housing2, append_chunks=True)
     with pytest.raises(
         pl.SchemaError,
         match=(
-            "cannot extend field with name: address to struct with field name: city,"
-            " please check your schema"
+            'cannot extend field with name "address" '
+            'to struct with field name "city"'
         ),
     ):
         housing1.append(housing2, append_chunks=False)
@@ -812,3 +825,66 @@ def test_sort_structs() -> None:
         "sex": ["female", "female", "male"],
         "age": [26, 38, 22],
     }
+
+
+def test_struct_args_kwargs() -> None:
+    df = pl.DataFrame({"a": [1, 2], "b": [3, 4], "c": ["a", "b"]})
+
+    # Single input
+    result = df.select(r=pl.struct((pl.col("a") + pl.col("b")).alias("p")))
+    expected = pl.DataFrame({"r": [{"p": 4}, {"p": 6}]})
+    assert_frame_equal(result, expected)
+
+    # List input
+    result = df.select(r=pl.struct([pl.col("a").alias("p"), pl.col("b").alias("q")]))
+    expected = pl.DataFrame({"r": [{"p": 1, "q": 3}, {"p": 2, "q": 4}]})
+    assert_frame_equal(result, expected)
+
+    # Positional input
+    result = df.select(r=pl.struct(pl.col("a").alias("p"), pl.col("b").alias("q")))
+    assert_frame_equal(result, expected)
+
+    # Keyword input
+    result = df.select(r=pl.struct(p="a", q="b"))
+    assert_frame_equal(result, expected)
+
+
+def test_struct_applies_as_map() -> None:
+    df = pl.DataFrame({"id": [1, 1, 2], "x": ["a", "b", "c"], "y": ["d", "e", "f"]})
+
+    # the window function doesn't really make sense
+    # but it runs the test: #7286
+    assert df.select(
+        pl.struct([pl.col("x"), pl.col("y") + pl.col("y")]).over("id")
+    ).to_dict(False) == {
+        "x": [{"x": "a", "y": "dd"}, {"x": "b", "y": "ee"}, {"x": "c", "y": "ff"}]
+    }
+
+
+def test_struct_with_lit() -> None:
+    expr = pl.struct([pl.col("a"), pl.lit(1).alias("b")])
+
+    assert (
+        pl.DataFrame({"a": pl.Series([], dtype=pl.Int64)}).select(expr).to_dict(False)
+    ) == {"a": []}
+
+    assert (
+        pl.DataFrame({"a": pl.Series([1], dtype=pl.Int64)}).select(expr).to_dict(False)
+    ) == {"a": [{"a": 1, "b": 1}]}
+
+    assert (
+        pl.DataFrame({"a": pl.Series([1, 2], dtype=pl.Int64)})
+        .select(expr)
+        .to_dict(False)
+    ) == {"a": [{"a": 1, "b": 1}, {"a": 2, "b": 1}]}
+
+
+def test_struct_unique_df() -> None:
+    df = pl.DataFrame(
+        {
+            "numerical": [1, 2, 1],
+            "struct": [{"x": 1, "y": 2}, {"x": 3, "y": 4}, {"x": 1, "y": 2}],
+        }
+    )
+
+    df.select("numerical", "struct").unique().sort("numerical")

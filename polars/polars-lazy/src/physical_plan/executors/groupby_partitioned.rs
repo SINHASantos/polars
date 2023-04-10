@@ -3,45 +3,55 @@ use polars_core::POOL;
 use rayon::prelude::*;
 
 use super::*;
+#[cfg(feature = "streaming")]
+use crate::physical_plan::planner::create_physical_plan;
 
 /// Take an input Executor and a multiple expressions
 pub struct PartitionGroupByExec {
     input: Box<dyn Executor>,
-    keys: Vec<Arc<dyn PhysicalExpr>>,
+    phys_keys: Vec<Arc<dyn PhysicalExpr>>,
     phys_aggs: Vec<Arc<dyn PhysicalExpr>>,
     maintain_order: bool,
     slice: Option<(i64, usize)>,
     input_schema: SchemaRef,
     output_schema: SchemaRef,
     from_partitioned_ds: bool,
+    #[allow(dead_code)]
+    keys: Vec<Expr>,
+    #[allow(dead_code)]
+    aggs: Vec<Expr>,
 }
 
 impl PartitionGroupByExec {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         input: Box<dyn Executor>,
-        keys: Vec<Arc<dyn PhysicalExpr>>,
+        phys_keys: Vec<Arc<dyn PhysicalExpr>>,
         phys_aggs: Vec<Arc<dyn PhysicalExpr>>,
         maintain_order: bool,
         slice: Option<(i64, usize)>,
         input_schema: SchemaRef,
         output_schema: SchemaRef,
         from_partitioned_ds: bool,
+        keys: Vec<Expr>,
+        aggs: Vec<Expr>,
     ) -> Self {
         Self {
             input,
-            keys,
+            phys_keys,
             phys_aggs,
             maintain_order,
             slice,
             input_schema,
             output_schema,
             from_partitioned_ds,
+            keys,
+            aggs,
         }
     }
 
     fn keys(&self, df: &DataFrame, state: &ExecutionState) -> PolarsResult<Vec<Series>> {
-        compute_keys(&self.keys, df, state)
+        compute_keys(&self.phys_keys, df, state)
     }
 }
 
@@ -66,7 +76,7 @@ fn run_partitions(
     let dfs = split_df(df, n_threads)?;
 
     let phys_aggs = &exec.phys_aggs;
-    let keys = &exec.keys;
+    let keys = &exec.phys_keys;
     POOL.install(|| {
         dfs.into_par_iter()
             .map(|df| {
@@ -82,30 +92,23 @@ fn run_partitions(
                     .map(|expr| {
                         let agg_expr = expr.as_partitioned_aggregator().unwrap();
                         let agg = agg_expr.evaluate_partitioned(&df, groups, state)?;
-                        if agg.len() != groups.len() {
-
-                            if agg.len() == 1 {
-                                Ok(match groups.len()  {
-                                    0 => agg.slice(0, 0),
-                                    len => agg.new_from_index(0, len)
-                                })
-                            } else {
-                                Err(PolarsError::ComputeError(
-                                    format!("returned aggregation is a different length: {} than the group lengths: {}",
-                                            agg.len(),
-                                            groups.len()).into()
-                                ))
+                        Ok(if agg.len() != groups.len() {
+                            polars_ensure!(agg.len() == 1, agg_len = agg.len(), groups.len());
+                            match groups.len() {
+                                0 => agg.clear(),
+                                len => agg.new_from_index(0, len),
                             }
-
                         } else {
-                            Ok(agg)
-                        }
-                    }).collect::<PolarsResult<Vec<_>>>()?;
+                            agg
+                        })
+                    })
+                    .collect::<PolarsResult<Vec<_>>>()?;
 
                 columns.extend_from_slice(&agg_columns);
 
                 DataFrame::new(columns)
-            }).collect()
+            })
+            .collect()
     })
 }
 
@@ -223,6 +226,49 @@ fn can_run_partitioned(
 }
 
 impl PartitionGroupByExec {
+    #[cfg(feature = "streaming")]
+    fn run_streaming(
+        &mut self,
+        state: &mut ExecutionState,
+        original_df: DataFrame,
+    ) -> Option<PolarsResult<DataFrame>> {
+        let lp = LogicalPlan::Aggregate {
+            input: Box::new(original_df.lazy().logical_plan),
+            keys: Arc::new(std::mem::take(&mut self.keys)),
+            aggs: std::mem::take(&mut self.aggs),
+            schema: self.output_schema.clone(),
+            apply: None,
+            maintain_order: false,
+            options: GroupbyOptions {
+                slice: self.slice,
+                ..Default::default()
+            },
+        };
+        let mut expr_arena = Default::default();
+        let mut lp_arena = Default::default();
+        let node = to_alp(lp, &mut expr_arena, &mut lp_arena).unwrap();
+
+        let inserted = streaming::insert_streaming_nodes(
+            node,
+            &mut lp_arena,
+            &mut expr_arena,
+            &mut vec![],
+            false,
+        )
+        .unwrap();
+
+        if inserted {
+            let mut phys_plan = create_physical_plan(node, &mut lp_arena, &mut expr_arena).unwrap();
+
+            if state.verbose() {
+                eprintln!("run STREAMING HASH AGGREGATION")
+            }
+            Some(phys_plan.execute(state))
+        } else {
+            None
+        }
+    }
+
     fn execute_impl(
         &mut self,
         state: &mut ExecutionState,
@@ -246,6 +292,12 @@ impl PartitionGroupByExec {
                     self.slice,
                 );
             }
+
+            #[cfg(feature = "streaming")]
+            if let Some(out) = self.run_streaming(state, original_df.clone()) {
+                return out;
+            }
+
             if state.verbose() {
                 eprintln!("run PARTITIONED HASH AGGREGATION")
             }
@@ -288,7 +340,7 @@ impl PartitionGroupByExec {
                 .phys_aggs
                 .par_iter()
                 // we slice the keys off and finalize every aggregation
-                .zip(&df.get_columns()[self.keys.len()..])
+                .zip(&df.get_columns()[self.phys_keys.len()..])
                 .map(|(expr, partitioned_s)| {
                     let agg_expr = expr.as_partitioned_aggregator().unwrap();
                     agg_expr.finalize(partitioned_s.clone(), groups, state)
@@ -319,11 +371,11 @@ impl Executor for PartitionGroupByExec {
 
         let profile_name = if state.has_node_timer() {
             let by = self
-                .keys
+                .phys_keys
                 .iter()
                 .map(|s| Ok(s.to_field(&self.input_schema)?.name))
                 .collect::<PolarsResult<Vec<_>>>()?;
-            let name = column_delimited("groupby_partitioned".to_string(), &by);
+            let name = comma_delimited("groupby_partitioned".to_string(), &by);
             Cow::Owned(name)
         } else {
             Cow::Borrowed("")

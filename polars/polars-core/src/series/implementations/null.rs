@@ -6,6 +6,7 @@ use polars_utils::IdxSize;
 
 use crate::datatypes::IdxCa;
 use crate::error::PolarsResult;
+use crate::prelude::explode::ExplodeByOffsets;
 use crate::prelude::*;
 use crate::series::private::{PrivateSeries, PrivateSeriesNumeric};
 use crate::series::*;
@@ -19,7 +20,7 @@ impl Series {
 
 #[derive(Clone)]
 pub struct NullChunked {
-    name: Arc<str>,
+    pub(crate) name: Arc<str>,
     length: IdxSize,
     // we still need chunks as many series consumers expect
     // chunks to be there
@@ -27,7 +28,7 @@ pub struct NullChunked {
 }
 
 impl NullChunked {
-    fn new(name: Arc<str>, len: usize) -> Self {
+    pub(crate) fn new(name: Arc<str>, len: usize) -> Self {
         Self {
             name,
             length: len as IdxSize,
@@ -48,6 +49,14 @@ impl PrivateSeries for NullChunked {
     fn _dtype(&self) -> &DataType {
         &DataType::Null
     }
+
+    #[cfg(feature = "zip_with")]
+    fn zip_with_same_type(&self, _mask: &BooleanChunked, _other: &Series) -> PolarsResult<Series> {
+        Ok(self.clone().into_series())
+    }
+    fn explode_by_offsets(&self, offsets: &[i64]) -> Series {
+        ExplodeByOffsets::explode_by_offsets(self, offsets)
+    }
 }
 
 impl SeriesTrait for NullChunked {
@@ -61,6 +70,10 @@ impl SeriesTrait for NullChunked {
 
     fn chunks(&self) -> &Vec<ArrayRef> {
         &self.chunks
+    }
+
+    fn chunk_lengths(&self) -> ChunkIdIter {
+        self.chunks.iter().map(|chunk| chunk.len())
     }
 
     #[cfg(feature = "chunked_ids")]
@@ -122,22 +135,13 @@ impl SeriesTrait for NullChunked {
     }
 
     fn get(&self, index: usize) -> PolarsResult<AnyValue> {
-        if index < self.len() {
-            Ok(AnyValue::Null)
-        } else {
-            Err(PolarsError::ComputeError(
-                format!(
-                    "index {index} is out of bounds on series of length {}",
-                    self.len()
-                )
-                .into(),
-            ))
-        }
+        polars_ensure!(index < self.len(), oob = index, self.len());
+        Ok(AnyValue::Null)
     }
 
     fn slice(&self, offset: i64, length: usize) -> Series {
-        let (offset, length) = slice_offsets(offset, length, self.len());
-        NullChunked::new(self.name.clone(), length - offset).into_series()
+        let (_, length) = slice_offsets(offset, length, self.len());
+        NullChunked::new(self.name.clone(), length).into_series()
     }
 
     fn is_null(&self) -> BooleanChunked {

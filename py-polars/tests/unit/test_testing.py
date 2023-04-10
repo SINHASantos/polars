@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, time, timedelta
+from typing import Any
+
 import pytest
 
 import polars as pl
@@ -91,6 +94,31 @@ def test_compare_series_nulls() -> None:
         assert_series_equal(srs1, srs2)
     with pytest.raises(AssertionError, match="Exact value mismatch"):
         assert_series_equal(srs1, srs2, check_exact=True)
+
+
+def test_series_cmp_fast_paths() -> None:
+    assert (
+        pl.Series([None], dtype=pl.Int32) != pl.Series([1, 2], dtype=pl.Int32)
+    ).to_list() == [True, True]
+    assert (
+        pl.Series([None], dtype=pl.Int32) == pl.Series([1, 2], dtype=pl.Int32)
+    ).to_list() == [False, False]
+
+    assert (
+        pl.Series([None], dtype=pl.Utf8) != pl.Series(["a", "b"], dtype=pl.Utf8)
+    ).to_list() == [True, True]
+    assert (
+        pl.Series([None], dtype=pl.Utf8) == pl.Series(["a", "b"], dtype=pl.Utf8)
+    ).to_list() == [False, False]
+
+    assert (
+        pl.Series([None], dtype=pl.Boolean)
+        != pl.Series([True, False], dtype=pl.Boolean)
+    ).to_list() == [True, True]
+    assert (
+        pl.Series([None], dtype=pl.Boolean)
+        == pl.Series([False, False], dtype=pl.Boolean)
+    ).to_list() == [False, False]
 
 
 def test_compare_series_value_mismatch_string() -> None:
@@ -206,12 +234,7 @@ def test_assert_frame_equal_column_mismatch_order() -> None:
     with pytest.raises(AssertionError, match="Columns are not in the same order"):
         assert_frame_equal(df1, df2)
 
-    # preferred/new param name
     assert_frame_equal(df1, df2, check_column_order=False)
-
-    # deprecated param name
-    with pytest.deprecated_call():
-        assert_frame_equal(df1, df2, check_column_names=False)  # type: ignore[call-arg]
 
 
 def test_assert_frame_equal_ignore_row_order() -> None:
@@ -259,3 +282,17 @@ def test_assert_series_equal_int_overflow() -> None:
         assert_series_equal(s0, s0, check_exact=check_exact)
         with pytest.raises(AssertionError):
             assert_series_equal(s1, s2, check_exact=check_exact)
+
+
+@pytest.mark.parametrize(
+    ("data1", "data2"),
+    [
+        ([datetime(2022, 10, 2, 12)], [datetime(2022, 10, 2, 13)]),
+        ([time(10, 0, 0)], [time(10, 0, 10)]),
+        ([timedelta(10, 0, 0)], [timedelta(10, 0, 10)]),
+    ],
+)
+def test_assert_series_equal_temporal(data1: Any, data2: Any) -> None:
+    s1 = pl.Series(data1)
+    s2 = pl.Series(data2)
+    assert_series_not_equal(s1, s2)

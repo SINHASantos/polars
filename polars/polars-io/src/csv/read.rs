@@ -1,5 +1,8 @@
 use super::*;
-use crate::csv::read_impl::{to_batched_owned, BatchedCsvReader, OwnedBatchedCsvReader};
+use crate::csv::read_impl::{
+    to_batched_owned_mmap, to_batched_owned_read, BatchedCsvReaderMmap, BatchedCsvReaderRead,
+    OwnedBatchedCsvReader, OwnedBatchedCsvReaderMmap,
+};
 use crate::csv::utils::infer_file_schema;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -111,11 +114,11 @@ where
     delimiter: Option<u8>,
     has_header: bool,
     ignore_errors: bool,
-    pub(crate) schema: Option<&'a Schema>,
+    pub(crate) schema: Option<SchemaRef>,
     encoding: CsvEncoding,
     n_threads: Option<usize>,
     path: Option<PathBuf>,
-    schema_overwrite: Option<&'a Schema>,
+    schema_overwrite: Option<SchemaRef>,
     dtype_overwrite: Option<&'a [DataType]>,
     sample_size: usize,
     chunk_size: usize,
@@ -129,8 +132,6 @@ where
     skip_rows_after_header: usize,
     try_parse_dates: bool,
     row_count: Option<RowCount>,
-    // temporary schema needed for batch lifetimes
-    owned_schema: Option<Box<Schema>>,
 }
 
 impl<'a, R> CsvReader<'a, R>
@@ -178,7 +179,7 @@ where
     /// in the csv parser and expects a complete Schema.
     ///
     /// It is recommended to use [with_dtypes](Self::with_dtypes) instead.
-    pub fn with_schema(mut self, schema: &'a Schema) -> Self {
+    pub fn with_schema(mut self, schema: SchemaRef) -> Self {
         self.schema = Some(schema);
         self
     }
@@ -233,7 +234,7 @@ where
 
     /// Overwrite the schema with the dtypes in this given Schema. The given schema may be a subset
     /// of the total schema.
-    pub fn with_dtypes(mut self, schema: Option<&'a Schema>) -> Self {
+    pub fn with_dtypes(mut self, schema: Option<SchemaRef>) -> Self {
         self.schema_overwrite = schema;
         self
     }
@@ -331,7 +332,7 @@ impl<'a> CsvReader<'a, File> {
 impl<'a, R: MmapBytesReader + 'a> CsvReader<'a, R> {
     fn core_reader<'b>(
         &'b mut self,
-        schema: Option<&'b Schema>,
+        schema: Option<SchemaRef>,
         to_cast: Vec<Field>,
     ) -> PolarsResult<CoreReader<'b>>
     where
@@ -347,7 +348,7 @@ impl<'a, R: MmapBytesReader + 'a> CsvReader<'a, R> {
             self.delimiter,
             self.has_header,
             self.ignore_errors,
-            self.schema,
+            self.schema.clone(),
             std::mem::take(&mut self.columns),
             self.encoding,
             self.n_threads,
@@ -403,34 +404,39 @@ impl<'a, R: MmapBytesReader + 'a> CsvReader<'a, R> {
         (schema, to_cast, _has_categorical)
     }
 
-    pub fn batched_borrowed(&'a mut self) -> PolarsResult<BatchedCsvReader<'a>> {
-        if let Some(schema) = self.schema_overwrite {
+    pub fn batched_borrowed_mmap(&'a mut self) -> PolarsResult<BatchedCsvReaderMmap<'a>> {
+        if let Some(schema) = self.schema_overwrite.as_deref() {
             let (schema, to_cast, has_cat) = self.prepare_schema_overwrite(schema);
-            self.owned_schema = Some(Box::new(schema));
+            let schema = Arc::new(schema);
 
-            // safety
-            // we boxed the schema and we refer to the boxed pointer
-            // the schema will drop once self drops
-            // so it is bound to 'a
-            let schema = unsafe {
-                std::mem::transmute::<Option<&Schema>, Option<&Schema>>(
-                    self.owned_schema.as_ref().map(|b| b.as_ref()),
-                )
-            };
-
-            let csv_reader = self.core_reader(schema, to_cast)?;
-            csv_reader.batched(has_cat)
+            let csv_reader = self.core_reader(Some(schema), to_cast)?;
+            csv_reader.batched_mmap(has_cat)
         } else {
-            let csv_reader = self.core_reader(self.schema, vec![])?;
-            csv_reader.batched(false)
+            let csv_reader = self.core_reader(self.schema.clone(), vec![])?;
+            csv_reader.batched_mmap(false)
+        }
+    }
+    pub fn batched_borrowed_read(&'a mut self) -> PolarsResult<BatchedCsvReaderRead<'a>> {
+        if let Some(schema) = self.schema_overwrite.as_deref() {
+            let (schema, to_cast, has_cat) = self.prepare_schema_overwrite(schema);
+            let schema = Arc::new(schema);
+
+            let csv_reader = self.core_reader(Some(schema), to_cast)?;
+            csv_reader.batched_read(has_cat)
+        } else {
+            let csv_reader = self.core_reader(self.schema.clone(), vec![])?;
+            csv_reader.batched_read(false)
         }
     }
 }
 
 impl<'a> CsvReader<'a, Box<dyn MmapBytesReader>> {
-    pub fn batched(mut self, schema: Option<SchemaRef>) -> PolarsResult<OwnedBatchedCsvReader> {
+    pub fn batched_mmap(
+        mut self,
+        schema: Option<SchemaRef>,
+    ) -> PolarsResult<OwnedBatchedCsvReaderMmap> {
         match schema {
-            Some(schema) => Ok(to_batched_owned(self, schema)),
+            Some(schema) => Ok(to_batched_owned_mmap(self, schema)),
             None => {
                 let reader_bytes = get_reader_bytes(&mut self.reader)?;
 
@@ -449,7 +455,35 @@ impl<'a> CsvReader<'a, Box<dyn MmapBytesReader>> {
                     self.try_parse_dates,
                 )?;
                 let schema = Arc::new(inferred_schema);
-                Ok(to_batched_owned(self, schema))
+                Ok(to_batched_owned_mmap(self, schema))
+            }
+        }
+    }
+    pub fn batched_read(
+        mut self,
+        schema: Option<SchemaRef>,
+    ) -> PolarsResult<OwnedBatchedCsvReader> {
+        match schema {
+            Some(schema) => Ok(to_batched_owned_read(self, schema)),
+            None => {
+                let reader_bytes = get_reader_bytes(&mut self.reader)?;
+
+                let (inferred_schema, _, _) = infer_file_schema(
+                    &reader_bytes,
+                    self.delimiter.unwrap_or(b','),
+                    self.max_records,
+                    self.has_header,
+                    None,
+                    &mut self.skip_rows_before_header,
+                    self.skip_rows_after_header,
+                    self.comment_char,
+                    self.quote_char,
+                    self.eol_char,
+                    self.null_values.as_ref(),
+                    self.try_parse_dates,
+                )?;
+                let schema = Arc::new(inferred_schema);
+                Ok(to_batched_owned_read(self, schema))
             }
         }
     }
@@ -490,22 +524,19 @@ where
             skip_rows_after_header: 0,
             try_parse_dates: false,
             row_count: None,
-            owned_schema: None,
         }
     }
 
     /// Read the file and create the DataFrame.
     fn finish(mut self) -> PolarsResult<DataFrame> {
         let rechunk = self.rechunk;
-        let schema_overwrite = self.schema_overwrite;
-        let dtype_overwrite = self.dtype_overwrite;
-        let should_parse_dates = self.try_parse_dates;
+        let schema_overwrite = self.schema_overwrite.clone();
         let low_memory = self.low_memory;
 
         #[cfg(feature = "dtype-categorical")]
         let mut _cat_lock = None;
 
-        let mut df = if let Some(schema) = schema_overwrite {
+        let mut df = if let Some(schema) = schema_overwrite.as_deref() {
             let (schema, to_cast, _has_cat) = self.prepare_schema_overwrite(schema);
 
             #[cfg(feature = "dtype-categorical")]
@@ -513,13 +544,14 @@ where
                 _cat_lock = Some(polars_core::IUseStringCache::new())
             }
 
-            let mut csv_reader = self.core_reader(Some(&schema), to_cast)?;
+            let mut csv_reader = self.core_reader(Some(Arc::new(schema)), to_cast)?;
             csv_reader.as_df()?
         } else {
             #[cfg(feature = "dtype-categorical")]
             {
                 let has_cat = self
                     .schema
+                    .clone()
                     .map(|schema| {
                         schema
                             .iter_dtypes()
@@ -530,7 +562,7 @@ where
                     _cat_lock = Some(polars_core::IUseStringCache::new())
                 }
             }
-            let mut csv_reader = self.core_reader(self.schema, vec![])?;
+            let mut csv_reader = self.core_reader(self.schema.clone(), vec![])?;
             csv_reader.as_df()?
         };
 
@@ -546,19 +578,19 @@ where
 
         #[cfg(feature = "temporal")]
         // only needed until we also can parse time columns in place
-        if should_parse_dates {
+        if self.try_parse_dates {
             // determine the schema that's given by the user. That should not be changed
-            let fixed_schema = match (schema_overwrite, dtype_overwrite) {
-                (Some(schema), _) => Cow::Borrowed(schema),
+            let fixed_schema = match (schema_overwrite, self.dtype_overwrite) {
+                (Some(schema), _) => schema,
                 (None, Some(dtypes)) => {
                     let fields = dtypes
                         .iter()
                         .zip(df.get_column_names())
                         .map(|(dtype, name)| Field::new(name, dtype.clone()));
 
-                    Cow::Owned(Schema::from(fields))
+                    Arc::new(Schema::from(fields))
                 }
-                _ => Cow::Owned(Schema::default()),
+                _ => Arc::default(),
             };
             df = parse_dates(df, &fixed_schema)
         }
@@ -568,22 +600,24 @@ where
 
 #[cfg(feature = "temporal")]
 fn parse_dates(mut df: DataFrame, fixed_schema: &Schema) -> DataFrame {
-    let cols = std::mem::take(df.get_columns_mut())
+    let cols = unsafe { std::mem::take(df.get_columns_mut()) }
         .into_par_iter()
         .map(|s| {
-            if let Ok(ca) = s.utf8() {
-                // don't change columns that are in the fixed schema.
-                if fixed_schema.index_of(s.name()).is_some() {
-                    return s;
-                }
+            match s.dtype() {
+                DataType::Utf8 => {
+                    let ca = s.utf8().unwrap();
+                    // don't change columns that are in the fixed schema.
+                    if fixed_schema.index_of(s.name()).is_some() {
+                        return s;
+                    }
 
-                #[cfg(feature = "dtype-time")]
-                if let Ok(ca) = ca.as_time(None, false) {
-                    return ca.into_series();
+                    #[cfg(feature = "dtype-time")]
+                    if let Ok(ca) = ca.as_time(None, false) {
+                        return ca.into_series();
+                    }
+                    s
                 }
-                s
-            } else {
-                s
+                _ => s,
             }
         })
         .collect::<Vec<_>>();

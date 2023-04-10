@@ -1,10 +1,17 @@
+#[cfg(feature = "timezones")]
+use arrow::temporal_conversions::parse_offset;
+#[cfg(feature = "timezones")]
+use chrono_tz::Tz;
+use polars_arrow::time_zone::PolarsTimeZone;
 use polars_arrow::utils::CustomIterTools;
 use polars_core::export::rayon::prelude::*;
 use polars_core::frame::groupby::GroupsProxy;
 use polars_core::prelude::*;
+use polars_core::series::IsSorted;
 use polars_core::POOL;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+use smartstring::alias::String as SmartString;
 
 use crate::prelude::*;
 
@@ -15,7 +22,7 @@ struct Wrap<T>(pub T);
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct DynamicGroupOptions {
     /// Time or index column
-    pub index_column: String,
+    pub index_column: SmartString,
     /// start a window at this interval
     pub every: Duration,
     /// window duration
@@ -33,7 +40,7 @@ pub struct DynamicGroupOptions {
 impl Default for DynamicGroupOptions {
     fn default() -> Self {
         Self {
-            index_column: "".to_string(),
+            index_column: "".into(),
             every: Duration::new(1),
             period: Duration::new(1),
             offset: Duration::new(1),
@@ -49,7 +56,7 @@ impl Default for DynamicGroupOptions {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct RollingGroupOptions {
     /// Time or index column
-    pub index_column: String,
+    pub index_column: SmartString,
     /// window duration
     pub period: Duration,
     pub offset: Duration,
@@ -97,46 +104,64 @@ impl Wrap<&DataFrame> {
         by: Vec<Series>,
         options: &RollingGroupOptions,
     ) -> PolarsResult<(Series, Vec<Series>, GroupsProxy)> {
-        let time = self.0.column(&options.index_column)?;
+        let time = self.0.column(&options.index_column)?.clone();
         let time_type = time.dtype();
 
-        if time.null_count() > 0 {
-            panic!("null values in dynamic groupby not yet supported, fill nulls.")
-        }
+        polars_ensure!(time.null_count() == 0, ComputeError: "null values in dynamic groupby not supported, fill nulls.");
 
         use DataType::*;
-        let (dt, tu) = match time_type {
-            Datetime(tu, _) => (time.clone(), *tu),
+        let (dt, tu, tz): (Series, TimeUnit, Option<TimeZone>) = match time_type {
+            Datetime(tu, tz) => (time.clone(), *tu, tz.clone()),
             Date => (
                 time.cast(&Datetime(TimeUnit::Milliseconds, None))?,
                 TimeUnit::Milliseconds,
+                None,
             ),
             Int32 => {
                 let time_type = Datetime(TimeUnit::Nanoseconds, None);
                 let dt = time.cast(&Int64).unwrap().cast(&time_type).unwrap();
-                let (out, by, gt) =
-                    self.impl_groupby_rolling(dt, by, options, TimeUnit::Nanoseconds, &time_type)?;
+                let (out, by, gt) = self.impl_groupby_rolling(
+                    dt,
+                    by,
+                    options,
+                    TimeUnit::Nanoseconds,
+                    NO_TIMEZONE.copied(),
+                    &time_type,
+                )?;
                 let out = out.cast(&Int64).unwrap().cast(&Int32).unwrap();
                 return Ok((out, by, gt));
             }
             Int64 => {
                 let time_type = Datetime(TimeUnit::Nanoseconds, None);
                 let dt = time.cast(&time_type).unwrap();
-                let (out, by, gt) =
-                    self.impl_groupby_rolling(dt, by, options, TimeUnit::Nanoseconds, &time_type)?;
+                let (out, by, gt) = self.impl_groupby_rolling(
+                    dt,
+                    by,
+                    options,
+                    TimeUnit::Nanoseconds,
+                    NO_TIMEZONE.copied(),
+                    &time_type,
+                )?;
                 let out = out.cast(&Int64).unwrap();
                 return Ok((out, by, gt));
             }
-            dt => {
-                return Err(PolarsError::ComputeError(
-                    format!(
-                    "expected any of the following dtypes {{Date, Datetime, Int32, Int64}}, got {dt}",
-                )
-                    .into(),
-                ))
-            }
+            dt => polars_bail!(
+                ComputeError:
+                "expected any of the following dtypes: {{ Date, Datetime, Int32, Int64 }}, got {}",
+                dt
+            ),
         };
-        self.impl_groupby_rolling(dt, by, options, tu, time_type)
+        match tz {
+            #[cfg(feature = "timezones")]
+            Some(tz) => match tz.parse::<Tz>() {
+                Ok(tz) => self.impl_groupby_rolling(dt, by, options, tu, Some(tz), time_type),
+                Err(_) => match parse_offset(&tz) {
+                    Ok(tz) => self.impl_groupby_rolling(dt, by, options, tu, Some(tz), time_type),
+                    Err(_) => unreachable!(),
+                },
+            },
+            _ => self.impl_groupby_rolling(dt, by, options, tu, NO_TIMEZONE.copied(), time_type),
+        }
     }
 
     /// Returns: time_keys, keys, groupsproxy
@@ -146,20 +171,18 @@ impl Wrap<&DataFrame> {
         options: &DynamicGroupOptions,
     ) -> PolarsResult<(Series, Vec<Series>, GroupsProxy)> {
         if options.offset.parsed_int || options.every.parsed_int || options.period.parsed_int {
-            assert!(
-                (options.offset.parsed_int || options.offset.is_zero())
+            polars_ensure!(
+                ((options.offset.parsed_int || options.offset.is_zero())
                     && (options.every.parsed_int || options.every.is_zero())
-                    && (options.period.parsed_int || options.period.is_zero()),
-                "you cannot combine time durations like '2h' with integer durations like '3i'"
+                    && (options.period.parsed_int || options.period.is_zero())),
+                ComputeError: "you cannot combine time durations like '2h' with integer durations like '3i'"
             )
         }
 
         let time = self.0.column(&options.index_column)?.rechunk();
         let time_type = time.dtype();
 
-        if time.null_count() > 0 {
-            panic!("null values in dynamic groupby not yet supported, fill nulls.")
-        }
+        polars_ensure!(time.null_count() == 0, ComputeError: "null values in dynamic groupby not supported, fill nulls.");
 
         use DataType::*;
         let (dt, tu) = match time_type {
@@ -194,29 +217,32 @@ impl Wrap<&DataFrame> {
                 }
                 return Ok((out, keys, gt));
             }
-            dt => {
-                return Err(PolarsError::ComputeError(
-                    format!(
-                    "expected any of the following dtypes {{Date, Datetime, Int32, Int64}}, got {dt}",
-                )
-                    .into(),
-                ))
-            }
+            dt => polars_bail!(
+                ComputeError:
+                "expected any of the following dtypes: {{ Date, Datetime, Int32, Int64 }}, got {}",
+                dt
+            ),
         };
         self.impl_groupby_dynamic(dt, by, options, tu, time_type)
     }
 
     fn impl_groupby_dynamic(
         &self,
-        dt: Series,
+        mut dt: Series,
         mut by: Vec<Series>,
         options: &DynamicGroupOptions,
         tu: TimeUnit,
         time_type: &DataType,
     ) -> PolarsResult<(Series, Vec<Series>, GroupsProxy)> {
+        polars_ensure!(!options.every.negative, ComputeError: "'every' argument must be positive");
         if dt.is_empty() {
             return dt.cast(time_type).map(|s| (s, by, GroupsProxy::default()));
         }
+
+        let sorted_set = matches!(dt.is_sorted_flag(), IsSorted::Ascending);
+        // a requirement for the index
+        // so we can set this such that downstream code has this info
+        dt.set_sorted_flag(IsSorted::Ascending);
 
         let w = Window::new(options.every, options.period, options.offset);
         let dt = dt.datetime().unwrap();
@@ -252,12 +278,15 @@ impl Wrap<&DataFrame> {
         let groups = if by.is_empty() {
             let vals = dt.downcast_iter().next().unwrap();
             let ts = vals.values().as_slice();
-            partially_check_sorted(ts);
+            if !sorted_set {
+                partially_check_sorted(ts);
+            }
             let (groups, lower, upper) = groupby_windows(
                 w,
                 ts,
                 options.closed_window,
                 tu,
+                tz,
                 include_lower_bound,
                 include_upper_bound,
                 options.start_by,
@@ -289,6 +318,7 @@ impl Wrap<&DataFrame> {
                                     ts,
                                     options.closed_window,
                                     tu,
+                                    tz,
                                     include_lower_bound,
                                     include_upper_bound,
                                     options.start_by,
@@ -318,6 +348,7 @@ impl Wrap<&DataFrame> {
                                     ts,
                                     options.closed_window,
                                     tu,
+                                    tz,
                                     include_lower_bound,
                                     include_upper_bound,
                                     options.start_by,
@@ -352,6 +383,7 @@ impl Wrap<&DataFrame> {
                                     ts,
                                     options.closed_window,
                                     tu,
+                                    tz,
                                     include_lower_bound,
                                     include_upper_bound,
                                     options.start_by,
@@ -373,6 +405,7 @@ impl Wrap<&DataFrame> {
                                     ts,
                                     options.closed_window,
                                     tu,
+                                    tz,
                                     include_lower_bound,
                                     include_upper_bound,
                                     options.start_by,
@@ -425,9 +458,13 @@ impl Wrap<&DataFrame> {
         by: Vec<Series>,
         options: &RollingGroupOptions,
         tu: TimeUnit,
+        tz: Option<impl PolarsTimeZone>,
         time_type: &DataType,
     ) -> PolarsResult<(Series, Vec<Series>, GroupsProxy)> {
         let mut dt = dt.rechunk();
+        // a requirement for the index
+        // so we can set this such that downstream code has this info
+        dt.set_sorted_flag(IsSorted::Ascending);
 
         let groups = if by.is_empty() {
             let dt = dt.datetime().unwrap();
@@ -440,6 +477,7 @@ impl Wrap<&DataFrame> {
                     ts,
                     options.closed_window,
                     tu,
+                    tz,
                 ),
                 rolling: true,
             }
@@ -471,6 +509,7 @@ impl Wrap<&DataFrame> {
                                 ts,
                                 options.closed_window,
                                 tu,
+                                tz.clone(),
                             );
                             update_subgroups_idx(&sub_groups, base_g)
                         })
@@ -491,6 +530,7 @@ impl Wrap<&DataFrame> {
                                 ts,
                                 options.closed_window,
                                 tu,
+                                tz.clone(),
                             );
                             update_subgroups_slice(&sub_groups, *base_g)
                         })
@@ -773,25 +813,6 @@ mod test {
         );
         assert_eq!(expected, groups);
         Ok(())
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_panic_integer_temporal_combine() {
-        let df = DataFrame::new_no_checks(vec![]);
-        let _ = df.groupby_dynamic(
-            vec![],
-            &DynamicGroupOptions {
-                index_column: "date".into(),
-                every: Duration::parse("1h"),
-                period: Duration::parse("1i"),
-                offset: Duration::parse("0h"),
-                truncate: true,
-                include_boundaries: true,
-                closed_window: ClosedWindow::Both,
-                start_by: Default::default(),
-            },
-        );
     }
 
     #[test]

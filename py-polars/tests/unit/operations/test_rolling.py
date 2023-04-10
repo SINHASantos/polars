@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import sys
 import typing
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
 
+if sys.version_info >= (3, 9):
+    from zoneinfo import ZoneInfo
+else:
+    # Import from submodule due to typing issue with backports.zoneinfo package:
+    # https://github.com/pganssle/zoneinfo/issues/125
+    from backports.zoneinfo._zoneinfo import ZoneInfo
+
 import polars as pl
 from polars.testing import assert_frame_equal
 
 if TYPE_CHECKING:
-    from polars.internals.type_aliases import ClosedInterval
+    from polars.type_aliases import ClosedInterval
 
 
 @pytest.fixture()
@@ -82,6 +90,30 @@ def test_rolling_skew() -> None:
             0.16923763134384154,
         ]
     )
+
+
+@pytest.mark.parametrize("time_zone", [None, "US/Central", "+01:00"])
+@pytest.mark.parametrize(
+    ("rolling_fn", "expected_values"),
+    [
+        ("rolling_mean", [None, 1.0, 2.0, 3.0, 4.0, 5.0]),
+        ("rolling_sum", [None, 1, 2, 3, 4, 5]),
+        ("rolling_min", [None, 1, 2, 3, 4, 5]),
+        ("rolling_max", [None, 1, 2, 3, 4, 5]),
+        ("rolling_std", [None, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ("rolling_var", [None, 0.0, 0.0, 0.0, 0.0, 0.0]),
+    ],
+)
+def test_rolling_crossing_dst(
+    time_zone: str | None, rolling_fn: str, expected_values: list[int | None | float]
+) -> None:
+    ts = pl.date_range(
+        datetime(2021, 11, 5), datetime(2021, 11, 10), "1d", time_zone="UTC"
+    ).dt.replace_time_zone(time_zone)
+    df = pl.DataFrame({"ts": ts, "value": [1, 2, 3, 4, 5, 6]})
+    result = df.with_columns(getattr(pl.col("value"), rolling_fn)("1d", by="ts"))
+    expected = pl.DataFrame({"ts": ts, "value": expected_values})
+    assert_frame_equal(result, expected)
 
 
 def test_rolling_extrema() -> None:
@@ -271,7 +303,7 @@ def test_rolling_slice_pushdown() -> None:
         )
         .agg(
             [
-                (pl.col("c") - pl.col("c").shift_and_fill(1, fill_value=0))
+                (pl.col("c") - pl.col("c").shift_and_fill(fill_value=0, periods=1))
                 .sum()
                 .alias("c")
             ]
@@ -295,7 +327,7 @@ def test_groupby_dynamic_slice_pushdown() -> None:
         )
         .agg(
             [
-                (pl.col("c") - pl.col("c").shift_and_fill(1, fill_value=0))
+                (pl.col("c") - pl.col("c").shift_and_fill(fill_value=0, periods=1))
                 .sum()
                 .alias("c")
             ]
@@ -410,10 +442,11 @@ def test_dynamic_groupby_timezone_awareness() -> None:
         ).dtypes == [pl.Datetime("ns", "UTC")] * 3 + [pl.Int64]
 
 
-def test_groupby_dynamic_startby_5599() -> None:
+@pytest.mark.parametrize("tzinfo", [None, ZoneInfo("Asia/Kathmandu")])
+def test_groupby_dynamic_startby_5599(tzinfo: ZoneInfo | None) -> None:
     # start by datapoint
-    start = datetime(2022, 12, 16)
-    stop = datetime(2022, 12, 16, hour=3)
+    start = datetime(2022, 12, 16, tzinfo=tzinfo)
+    stop = datetime(2022, 12, 16, hour=3, tzinfo=tzinfo)
     df = pl.DataFrame({"date": pl.date_range(start, stop, "30m")})
 
     assert df.groupby_dynamic(
@@ -424,35 +457,35 @@ def test_groupby_dynamic_startby_5599() -> None:
         start_by="datapoint",
     ).agg(pl.count()).to_dict(False) == {
         "_lower_boundary": [
-            datetime(2022, 12, 16, 0, 0),
-            datetime(2022, 12, 16, 0, 31),
-            datetime(2022, 12, 16, 1, 2),
-            datetime(2022, 12, 16, 1, 33),
-            datetime(2022, 12, 16, 2, 4),
-            datetime(2022, 12, 16, 2, 35),
+            datetime(2022, 12, 16, 0, 0, tzinfo=tzinfo),
+            datetime(2022, 12, 16, 0, 31, tzinfo=tzinfo),
+            datetime(2022, 12, 16, 1, 2, tzinfo=tzinfo),
+            datetime(2022, 12, 16, 1, 33, tzinfo=tzinfo),
+            datetime(2022, 12, 16, 2, 4, tzinfo=tzinfo),
+            datetime(2022, 12, 16, 2, 35, tzinfo=tzinfo),
         ],
         "_upper_boundary": [
-            datetime(2022, 12, 16, 0, 31),
-            datetime(2022, 12, 16, 1, 2),
-            datetime(2022, 12, 16, 1, 33),
-            datetime(2022, 12, 16, 2, 4),
-            datetime(2022, 12, 16, 2, 35),
-            datetime(2022, 12, 16, 3, 6),
+            datetime(2022, 12, 16, 0, 31, tzinfo=tzinfo),
+            datetime(2022, 12, 16, 1, 2, tzinfo=tzinfo),
+            datetime(2022, 12, 16, 1, 33, tzinfo=tzinfo),
+            datetime(2022, 12, 16, 2, 4, tzinfo=tzinfo),
+            datetime(2022, 12, 16, 2, 35, tzinfo=tzinfo),
+            datetime(2022, 12, 16, 3, 6, tzinfo=tzinfo),
         ],
         "date": [
-            datetime(2022, 12, 16, 0, 0),
-            datetime(2022, 12, 16, 1, 0),
-            datetime(2022, 12, 16, 1, 30),
-            datetime(2022, 12, 16, 2, 0),
-            datetime(2022, 12, 16, 2, 30),
-            datetime(2022, 12, 16, 3, 0),
+            datetime(2022, 12, 16, 0, 0, tzinfo=tzinfo),
+            datetime(2022, 12, 16, 1, 0, tzinfo=tzinfo),
+            datetime(2022, 12, 16, 1, 30, tzinfo=tzinfo),
+            datetime(2022, 12, 16, 2, 0, tzinfo=tzinfo),
+            datetime(2022, 12, 16, 2, 30, tzinfo=tzinfo),
+            datetime(2022, 12, 16, 3, 0, tzinfo=tzinfo),
         ],
         "count": [2, 1, 1, 1, 1, 1],
     }
 
     # start by week
-    start = datetime(2022, 1, 1)
-    stop = datetime(2022, 1, 12, 7)
+    start = datetime(2022, 1, 1, tzinfo=tzinfo)
+    stop = datetime(2022, 1, 12, 7, tzinfo=tzinfo)
 
     df = pl.DataFrame({"date": pl.date_range(start, stop, "12h")}).with_columns(
         pl.col("date").dt.weekday().alias("day")
@@ -466,9 +499,18 @@ def test_groupby_dynamic_startby_5599() -> None:
         start_by="monday",
         truncate=False,
     ).agg([pl.count(), pl.col("day").first().alias("data_day")]).to_dict(False) == {
-        "_lower_boundary": [datetime(2022, 1, 3, 0, 0), datetime(2022, 1, 10, 0, 0)],
-        "_upper_boundary": [datetime(2022, 1, 6, 0, 0), datetime(2022, 1, 13, 0, 0)],
-        "date": [datetime(2022, 1, 3, 0, 0), datetime(2022, 1, 10, 0, 0)],
+        "_lower_boundary": [
+            datetime(2022, 1, 3, 0, 0, tzinfo=tzinfo),
+            datetime(2022, 1, 10, 0, 0, tzinfo=tzinfo),
+        ],
+        "_upper_boundary": [
+            datetime(2022, 1, 6, 0, 0, tzinfo=tzinfo),
+            datetime(2022, 1, 13, 0, 0, tzinfo=tzinfo),
+        ],
+        "date": [
+            datetime(2022, 1, 3, 0, 0, tzinfo=tzinfo),
+            datetime(2022, 1, 10, 0, 0, tzinfo=tzinfo),
+        ],
         "count": [6, 5],
         "data_day": [1, 1],
     }
@@ -553,3 +595,22 @@ def test_rolling_skew_window_offset() -> None:
     assert (pl.arange(0, 20, eager=True) ** 2).rolling_skew(20)[
         -1
     ] == 0.6612545648596286
+
+
+def test_rolling_kernels_groupby_dynamic_7548() -> None:
+    assert pl.DataFrame(
+        {"time": pl.arange(0, 4, eager=True), "value": pl.arange(0, 4, eager=True)}
+    ).groupby_dynamic("time", every="1i", period="3i").agg(
+        pl.col("value"),
+        pl.col("value").min().alias("min_value"),
+        pl.col("value").max().alias("max_value"),
+        pl.col("value").sum().alias("sum_value"),
+    ).to_dict(
+        False
+    ) == {
+        "time": [0, 1, 2, 3],
+        "value": [[0, 1, 2], [1, 2, 3], [2, 3], [3]],
+        "min_value": [0, 1, 2, 3],
+        "max_value": [2, 3, 3, 3],
+        "sum_value": [3, 6, 5, 3],
+    }

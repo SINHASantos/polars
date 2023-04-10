@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import sys
 import typing
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from random import shuffle
 from typing import Any
@@ -12,7 +13,15 @@ import pyarrow as pa
 import pytest
 
 import polars as pl
+from polars.dependencies import _ZONEINFO_AVAILABLE
 from polars.testing import assert_frame_equal, assert_series_equal
+
+if sys.version_info >= (3, 9):
+    from zoneinfo import ZoneInfo
+elif _ZONEINFO_AVAILABLE:
+    # Import from submodule due to typing issue with backports.zoneinfo package:
+    # https://github.com/pganssle/zoneinfo/issues/125
+    from backports.zoneinfo._zoneinfo import ZoneInfo
 
 
 def test_init_dict() -> None:
@@ -32,9 +41,9 @@ def test_init_dict() -> None:
         assert df.shape == (0, 2)
         assert df.schema == {"a": pl.Date, "b": pl.Utf8}
 
-    # List of empty list/tuple
-    df = pl.DataFrame({"a": [[]], "b": [()]})
-    expected = {"a": pl.List(pl.Float64), "b": pl.List(pl.Float64)}
+    # List of empty list
+    df = pl.DataFrame({"a": [[]], "b": [[]]})
+    expected = {"a": pl.List(pl.Int32), "b": pl.List(pl.Int32)}
     assert df.schema == expected
     assert df.rows() == [([], [])]
 
@@ -104,9 +113,13 @@ def test_init_dict() -> None:
         assert df.to_dict(False)["field"][0] == test[0]["field"]
 
 
-def test_init_dataclasses_and_namedtuple() -> None:
+def test_init_dataclasses_and_namedtuple(monkeypatch: Any) -> None:
     from dataclasses import dataclass
     from typing import NamedTuple
+
+    monkeypatch.setenv("POLARS_ACTIVATE_DECIMAL", "1")
+
+    from polars.utils._construction import dataclass_type_hints
 
     @dataclass
     class TradeDC:
@@ -135,7 +148,7 @@ def test_init_dataclasses_and_namedtuple() -> None:
             assert df.schema == {
                 "timestamp": pl.Datetime("us"),
                 "ticker": pl.Utf8,
-                "price": pl.Float64,
+                "price": pl.Decimal(None, 1),
                 "size": pl.Int64,
             }
             assert df.rows() == raw_data
@@ -148,7 +161,7 @@ def test_init_dataclasses_and_namedtuple() -> None:
             assert df.schema == {
                 "timestamp": pl.Datetime("ms"),
                 "ticker": pl.Utf8,
-                "price": pl.Float64,
+                "price": pl.Decimal(None, 1),
                 "size": pl.Int32,
             }
 
@@ -158,17 +171,20 @@ def test_init_dataclasses_and_namedtuple() -> None:
             schema=[
                 ("ts", pl.Datetime("ms")),
                 ("tk", pl.Categorical),
-                ("pc", pl.Float32),
+                ("pc", pl.Decimal(None, 1)),
                 ("sz", pl.UInt16),
             ],
         )
         assert df.schema == {
             "ts": pl.Datetime("ms"),
             "tk": pl.Categorical,
-            "pc": pl.Float32,
+            "pc": pl.Decimal(None, 1),
             "sz": pl.UInt16,
         }
         assert df.rows() == raw_data
+
+        # cover a miscellaneous edge-case when detecting the annotations
+        assert dataclass_type_hints(obj=type(None)) == {}
 
 
 def test_init_ndarray(monkeypatch: Any) -> None:
@@ -259,9 +275,7 @@ def test_init_ndarray(monkeypatch: Any) -> None:
         _ = pl.DataFrame(np.array([[1, 2], [3, 4]]), schema=["a"])
 
     # NumPy not available
-    monkeypatch.setattr(
-        pl.internals.dataframe.frame, "_check_for_numpy", lambda x: False
-    )
+    monkeypatch.setattr(pl.dataframe.frame, "_check_for_numpy", lambda x: False)
     with pytest.raises(ValueError):
         pl.DataFrame(np.array([1, 2, 3]), schema=["a"])
 
@@ -430,6 +444,24 @@ def test_init_1d_sequence() -> None:
     # String sequence
     assert pl.DataFrame("abc", schema=["s"]).to_dict(False) == {"s": ["a", "b", "c"]}
 
+    # datetimes sequence
+    df = pl.DataFrame([datetime(2020, 1, 1)], schema={"ts": pl.Datetime("ms")})
+    assert df.schema == {"ts": pl.Datetime("ms")}
+    df = pl.DataFrame(
+        [datetime(2020, 1, 1, tzinfo=timezone.utc)], schema={"ts": pl.Datetime("ms")}
+    )
+    assert df.schema == {"ts": pl.Datetime("ms", "UTC")}
+    df = pl.DataFrame(
+        [datetime(2020, 1, 1, tzinfo=timezone(timedelta(hours=1)))],
+        schema={"ts": pl.Datetime("ms")},
+    )
+    assert df.schema == {"ts": pl.Datetime("ms", "+01:00")}
+    df = pl.DataFrame(
+        [datetime(2020, 1, 1, tzinfo=ZoneInfo("Asia/Kathmandu"))],
+        schema={"ts": pl.Datetime("ms")},
+    )
+    assert df.schema == {"ts": pl.Datetime("ms", "Asia/Kathmandu")}
+
 
 def test_init_pandas(monkeypatch: Any) -> None:
     pandas_df = pd.DataFrame([[1, 2], [3, 4]], columns=[1, 2])
@@ -475,9 +507,7 @@ def test_init_pandas(monkeypatch: Any) -> None:
     assert df.rows() == [(datetime(2022, 10, 31, 10, 30, 45, 123456),)]
 
     # pandas is not available
-    monkeypatch.setattr(
-        pl.internals.dataframe.frame, "_check_for_pandas", lambda x: False
-    )
+    monkeypatch.setattr(pl.dataframe.frame, "_check_for_pandas", lambda x: False)
     with pytest.raises(ValueError):
         pl.DataFrame(pandas_df)
 
@@ -619,7 +649,9 @@ def test_upcast_primitive_and_strings() -> None:
     assert pl.Series([1, 1.0, "1.0"]).dtype == pl.Utf8
     assert pl.Series([True, 1]).dtype == pl.Int64
     assert pl.Series([True, 1.0]).dtype == pl.Float64
-    assert pl.Series([True, "1.0"]).dtype == pl.Utf8
+    assert pl.Series([True, 1], dtype=pl.Boolean).dtype == pl.Boolean
+    assert pl.Series([False, 1.0], dtype=pl.Boolean).dtype == pl.Boolean
+    assert pl.Series([False, "1.0"]).dtype == pl.Utf8
     assert pl.from_dict({"a": [1, 2.1, 3], "b": [4, 5, 6.4]}).dtypes == [
         pl.Float64,
         pl.Float64,
@@ -908,10 +940,43 @@ def test_nested_schema_construction() -> None:
     }
 
 
-def test_array_to_pyseries_with_one_chunk_does_not_copy_data() -> None:
+def test_arrow_to_pyseries_with_one_chunk_does_not_copy_data() -> None:
+    from polars.utils._construction import arrow_to_pyseries
+
     original_array = pa.chunked_array([[1, 2, 3]], type=pa.int64())
-    pyseries = pl.internals.construction.arrow_to_pyseries("", original_array)
+    pyseries = arrow_to_pyseries("", original_array)
     assert (
         pyseries.get_chunks()[0]._get_ptr()
         == original_array.chunks[0].buffers()[1].address
     )
+
+
+def test_init_with_explicit_binary_schema() -> None:
+    df = pl.DataFrame({"a": [b"hello", b"world"]}, schema={"a": pl.Binary})
+    assert df.schema == {"a": pl.Binary}
+    assert df["a"].to_list() == [b"hello", b"world"]
+
+    s = pl.Series("a", [b"hello", b"world"], dtype=pl.Binary)
+    assert s.dtype == pl.Binary
+    assert s.to_list() == [b"hello", b"world"]
+
+
+def test_nested_categorical() -> None:
+    s = pl.Series([["a"]], dtype=pl.List(pl.Categorical))
+    assert s.to_list() == [["a"]]
+    assert s.dtype == pl.List(pl.Categorical)
+
+
+def test_datetime_date_subclasses() -> None:
+    class FakeDate(date):
+        ...
+
+    class FakeDatetime(FakeDate, datetime):
+        ...
+
+    result = pl.Series([FakeDatetime(2020, 1, 1, 3)])
+    expected = pl.Series([datetime(2020, 1, 1, 3)])
+    assert_series_equal(result, expected)
+    result = pl.Series([FakeDate(2020, 1, 1)])
+    expected = pl.Series([date(2020, 1, 1)])
+    assert_series_equal(result, expected)

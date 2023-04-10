@@ -154,7 +154,7 @@ fn repeat(value: &PyAny, n_times: PyExpr) -> PyResult<PyExpr> {
     } else if let Ok(int) = value.downcast::<PyInt>() {
         let val = int.extract::<i64>().unwrap();
 
-        if val > 0 && val < i32::MAX as i64 || val < 0 && val > i32::MIN as i64 {
+        if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
             Ok(polars_rs::lazy::dsl::repeat(val as i32, n_times.inner).into())
         } else {
             Ok(polars_rs::lazy::dsl::repeat(val, n_times.inner).into())
@@ -220,13 +220,13 @@ fn when(predicate: PyExpr) -> dsl::When {
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[pyfunction]
-fn version() -> &'static str {
+fn get_polars_version() -> &'static str {
     VERSION
 }
 
 #[pyfunction]
-fn toggle_string_cache(toggle: bool) {
-    polars_rs::toggle_string_cache(toggle)
+fn enable_string_cache(toggle: bool) {
+    polars_rs::enable_string_cache(toggle)
 }
 
 #[pyfunction]
@@ -235,15 +235,16 @@ fn using_string_cache() -> bool {
 }
 
 #[pyfunction]
-fn concat_str(s: Vec<dsl::PyExpr>, sep: &str) -> dsl::PyExpr {
+fn concat_str(s: Vec<dsl::PyExpr>, separator: &str) -> dsl::PyExpr {
     let s = s.into_iter().map(|e| e.inner).collect::<Vec<_>>();
-    polars_rs::lazy::dsl::concat_str(s, sep).into()
+    polars_rs::lazy::dsl::concat_str(s, separator).into()
 }
 
 #[pyfunction]
-fn concat_lst(s: Vec<dsl::PyExpr>) -> dsl::PyExpr {
+fn concat_lst(s: Vec<dsl::PyExpr>) -> PyResult<dsl::PyExpr> {
     let s = s.into_iter().map(|e| e.inner).collect::<Vec<_>>();
-    polars_rs::lazy::dsl::concat_lst(s).into()
+    let expr = polars_rs::lazy::dsl::concat_lst(s).map_err(PyPolarsErr::from)?;
+    Ok(expr.into())
 }
 
 #[pyfunction]
@@ -309,7 +310,7 @@ fn concat_df(dfs: &PyAny, py: Python) -> PyResult<PyDataFrame> {
     let first = iter.next().unwrap()?;
 
     let first_rdf = get_df(first)?;
-    let identity_df = first_rdf.slice(0, 0);
+    let identity_df = first_rdf.clear();
 
     let mut rdfs: Vec<PolarsResult<DataFrame>> = vec![Ok(first_rdf)];
 
@@ -501,8 +502,8 @@ fn py_date_range(
     every: &str,
     closed: Wrap<ClosedWindow>,
     name: &str,
-    tu: Wrap<TimeUnit>,
-    tz: Option<TimeZone>,
+    time_unit: Wrap<TimeUnit>,
+    time_zone: Option<TimeZone>,
 ) -> PyResult<PySeries> {
     let date_range = polars_rs::time::date_range_impl(
         name,
@@ -510,8 +511,8 @@ fn py_date_range(
         stop,
         Duration::parse(every),
         closed.0,
-        tu.0,
-        tz.as_ref(),
+        time_unit.0,
+        time_zone.as_ref(),
     )
     .map_err(PyPolarsErr::from)?;
     Ok(date_range.into_series().into())
@@ -524,12 +525,12 @@ fn py_date_range_lazy(
     every: &str,
     closed: Wrap<ClosedWindow>,
     name: String,
-    tz: Option<TimeZone>,
+    time_zone: Option<TimeZone>,
 ) -> PyExpr {
     let start = start.inner;
     let end = end.inner;
     let every = Duration::parse(every);
-    polars_rs::lazy::dsl::functions::date_range(name, start, end, every, closed.0, tz).into()
+    polars_rs::lazy::dsl::functions::date_range(name, start, end, every, closed.0, time_zone).into()
 }
 
 #[pyfunction]
@@ -563,18 +564,18 @@ fn as_struct(exprs: Vec<PyExpr>) -> PyExpr {
 }
 
 #[pyfunction]
-fn pool_size() -> usize {
-    POOL.current_num_threads()
-}
-
-#[pyfunction]
 fn arg_where(condition: PyExpr) -> PyExpr {
     polars_rs::lazy::dsl::arg_where(condition.inner).into()
 }
 
 #[pyfunction]
-fn get_idx_type(py: Python) -> PyObject {
+fn get_index_type(py: Python) -> PyObject {
     Wrap(IDX_DTYPE).to_object(py)
+}
+
+#[pyfunction]
+fn threadpool_size() -> usize {
+    POOL.current_num_threads()
 }
 
 #[pyfunction]
@@ -593,6 +594,16 @@ fn set_float_fmt(fmt: &str) -> PyResult<()> {
     Ok(())
 }
 
+#[pyfunction]
+fn get_float_fmt() -> PyResult<String> {
+    use polars_core::fmt::{get_float_fmt, FloatFmt};
+    let strfmt = match get_float_fmt() {
+        FloatFmt::Full => "full",
+        FloatFmt::Mixed => "mixed",
+    };
+    Ok(strfmt.to_string())
+}
+
 #[pymodule]
 fn polars(py: Python, m: &PyModule) -> PyResult<()> {
     m.add("ArrowError", py.get_type::<ArrowErrorException>())
@@ -609,7 +620,7 @@ fn polars(py: Python, m: &PyModule) -> PyResult<()> {
     )
     .unwrap();
     m.add("NoDataError", py.get_type::<NoDataError>()).unwrap();
-    m.add("PanicException", py.get_type::<PanicException>())
+    m.add("PolarsPanicError", py.get_type::<PanicException>())
         .unwrap();
     m.add("SchemaError", py.get_type::<SchemaError>()).unwrap();
     m.add(
@@ -658,8 +669,8 @@ fn polars(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(cov)).unwrap();
     m.add_wrapped(wrap_pyfunction!(arg_sort_by)).unwrap();
     m.add_wrapped(wrap_pyfunction!(when)).unwrap();
-    m.add_wrapped(wrap_pyfunction!(version)).unwrap();
-    m.add_wrapped(wrap_pyfunction!(toggle_string_cache))
+    m.add_wrapped(wrap_pyfunction!(get_polars_version)).unwrap();
+    m.add_wrapped(wrap_pyfunction!(enable_string_cache))
         .unwrap();
     m.add_wrapped(wrap_pyfunction!(using_string_cache)).unwrap();
     m.add_wrapped(wrap_pyfunction!(concat_str)).unwrap();
@@ -686,10 +697,11 @@ fn polars(py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(max_exprs)).unwrap();
     m.add_wrapped(wrap_pyfunction!(as_struct)).unwrap();
     m.add_wrapped(wrap_pyfunction!(repeat)).unwrap();
-    m.add_wrapped(wrap_pyfunction!(pool_size)).unwrap();
+    m.add_wrapped(wrap_pyfunction!(threadpool_size)).unwrap();
     m.add_wrapped(wrap_pyfunction!(arg_where)).unwrap();
-    m.add_wrapped(wrap_pyfunction!(get_idx_type)).unwrap();
+    m.add_wrapped(wrap_pyfunction!(get_index_type)).unwrap();
     m.add_wrapped(wrap_pyfunction!(coalesce_exprs)).unwrap();
     m.add_wrapped(wrap_pyfunction!(set_float_fmt)).unwrap();
+    m.add_wrapped(wrap_pyfunction!(get_float_fmt)).unwrap();
     Ok(())
 }

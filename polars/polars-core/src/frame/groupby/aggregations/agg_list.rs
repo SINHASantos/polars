@@ -175,6 +175,7 @@ impl AggList for BooleanChunked {
 
 impl AggList for Utf8Chunked {
     unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
+        // TODO: dispatch via binary
         match groups {
             GroupsProxy::Idx(groups) => {
                 let mut builder =
@@ -198,7 +199,6 @@ impl AggList for Utf8Chunked {
     }
 }
 
-#[cfg(feature = "dtype-binary")]
 impl AggList for BinaryChunked {
     unsafe fn agg_list(&self, groups: &GroupsProxy) -> Series {
         match groups {
@@ -229,6 +229,8 @@ fn agg_list_list<F: Fn(&ListChunked, bool, &mut Vec<i64>, &mut i64, &mut Vec<Arr
     groups_len: usize,
     func: F,
 ) -> Series {
+    let inner_dtype = ca.inner_dtype();
+    let inner_dtype_physical = inner_dtype.to_physical();
     let can_fast_explode = true;
     let mut offsets = Vec::<i64>::with_capacity(groups_len + 1);
     let mut length_so_far = 0i64;
@@ -262,6 +264,9 @@ fn agg_list_list<F: Fn(&ListChunked, bool, &mut Vec<i64>, &mut i64, &mut Vec<Arr
     let mut listarr = unsafe { ListChunked::from_chunks(ca.name(), vec![arr]) };
     if can_fast_explode {
         listarr.set_fast_explode()
+    }
+    if inner_dtype_physical != inner_dtype {
+        listarr.to_logical(DataType::List(Box::new(inner_dtype)));
     }
     listarr.into_series()
 }

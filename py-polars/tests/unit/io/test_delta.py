@@ -1,10 +1,15 @@
-from pathlib import Path  # noqa: TCH003
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import pyarrow.fs
 import pytest
 
 import polars as pl
 from polars.testing import assert_frame_equal, assert_frame_not_equal
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.fixture()
@@ -34,8 +39,12 @@ def test_scan_delta_columns(delta_table_path: Path) -> None:
 
 
 def test_scan_delta_filesystem(delta_table_path: Path) -> None:
-    fs = pyarrow.fs.LocalFileSystem()
-    ldf = pl.scan_delta(str(delta_table_path), version=0, raw_filesystem=fs)
+    raw_filesystem = pyarrow.fs.LocalFileSystem()
+    fs = pyarrow.fs.SubTreeFileSystem(str(delta_table_path), raw_filesystem)
+
+    ldf = pl.scan_delta(
+        str(delta_table_path), version=0, pyarrow_options={"filesystem": fs}
+    )
 
     expected = pl.DataFrame({"name": ["Joey", "Ivan"], "age": [14, 32]})
     assert_frame_equal(expected, ldf.collect(), check_dtype=False)

@@ -2,12 +2,13 @@ use polars_core::prelude::*;
 use polars_lazy::dsl::Expr;
 use polars_lazy::prelude::*;
 use sqlparser::ast::{
-    BinaryOperator as SQLBinaryOperator, BinaryOperator, DataType as SQLDataType, Expr as SqlExpr,
-    Function as SQLFunction, JoinConstraint, TrimWhereField, Value as SqlValue,
+    ArrayAgg, BinaryOperator as SQLBinaryOperator, BinaryOperator, DataType as SQLDataType,
+    Expr as SqlExpr, Function as SQLFunction, JoinConstraint, OrderByExpr, TrimWhereField,
+    UnaryOperator, Value as SqlValue,
 };
 
-use crate::context::TABLES;
 use crate::functions::SqlFunctionVisitor;
+use crate::SQLContext;
 
 pub(crate) fn map_sql_polars_datatype(data_type: &SQLDataType) -> PolarsResult<DataType> {
     Ok(match data_type {
@@ -36,22 +37,16 @@ pub(crate) fn map_sql_polars_datatype(data_type: &SQLDataType) -> PolarsResult<D
         SQLDataType::Array(Some(inner_type)) => {
             DataType::List(Box::new(map_sql_polars_datatype(inner_type)?))
         }
-        _ => {
-            return Err(PolarsError::ComputeError(
-                format!(
-                    "SQL Datatype {:?} was not supported in polars-sql yet!",
-                    data_type
-                )
-                .into(),
-            ))
-        }
+        _ => polars_bail!(ComputeError: "SQL datatype {:?} is not yet supported", data_type),
     })
 }
 
 /// Recursively walks a SQL Expr to create a polars Expr
-pub(crate) struct SqlExprVisitor {}
+pub(crate) struct SqlExprVisitor<'a> {
+    ctx: &'a SQLContext,
+}
 
-impl SqlExprVisitor {
+impl SqlExprVisitor<'_> {
     fn visit_expr(&self, expr: &SqlExpr) -> PolarsResult<Expr> {
         match expr {
             SqlExpr::CompoundIdentifier(idents) => self.visit_compound_identifier(idents),
@@ -62,8 +57,9 @@ impl SqlExprVisitor {
             SqlExpr::Value(value) => self.visit_literal(value),
             SqlExpr::IsNull(expr) => Ok(self.visit_expr(expr)?.is_null()),
             SqlExpr::IsNotNull(expr) => Ok(self.visit_expr(expr)?.is_not_null()),
-            SqlExpr::Floor { expr, .. } => self.visit_expr(expr),
-            SqlExpr::Ceil { expr, .. } => self.visit_expr(expr),
+            SqlExpr::Floor { expr, .. } => Ok(self.visit_expr(expr)?.floor()),
+            SqlExpr::Ceil { expr, .. } => Ok(self.visit_expr(expr)?.ceil()),
+            SqlExpr::ArrayAgg(expr) => self.visit_arr_agg(expr),
             SqlExpr::Between {
                 expr,
                 negated,
@@ -82,9 +78,8 @@ impl SqlExprVisitor {
             SqlExpr::AnyOp(expr) => Ok(self.visit_expr(expr)?.any()),
             SqlExpr::AllOp(_) => Ok(self.visit_expr(expr)?.all()),
             SqlExpr::Nested(expr) => self.visit_expr(expr),
-            other => Err(PolarsError::ComputeError(
-                format!("SQL Expr {:?} was not supported in polars-sql yet!", other).into(),
-            )),
+            SqlExpr::UnaryOp { op, expr } => self.visit_unary_op(op, expr),
+            other => polars_bail!(ComputeError: "SQL expression {:?} is not yet supported", other),
         }
     }
 
@@ -92,28 +87,28 @@ impl SqlExprVisitor {
     ///
     /// e.g. df.column or "df"."column"
     fn visit_compound_identifier(&self, idents: &[sqlparser::ast::Ident]) -> PolarsResult<Expr> {
-        if idents.len() != 2 {
-            return Err(PolarsError::ComputeError(
-                format!("Compound identifier: {:?} is not yet supported", idents).into(),
-            ));
-        }
+        polars_ensure!(
+            idents.len() == 2,
+            ComputeError: "compound identifier {:?} is not yet supported", idents,
+        );
         let tbl_name = &idents[0].value;
-        let refers_main_table = TABLES.with(|cell| {
-            let tables = cell.borrow();
-            tables.len() == 1 && tables.contains(tbl_name)
-        });
-
-        if refers_main_table {
-            Ok(col(&idents[1].value))
-        } else {
-            Err(PolarsError::ComputeError(
-                format!(
-                    "Compounded identifier: {:?} is not yet supported  if multiple tables are registered",
-                    idents
-                )
-                    .into(),
-            ))
-        }
+        let refers_main_table =
+            { self.ctx.tables.len() == 1 && self.ctx.tables.contains(&tbl_name) };
+        polars_ensure!(
+            refers_main_table, ComputeError:
+            "compound identifier {:?} is not yet supported if multiple tables are registered",
+            idents
+        );
+        Ok(col(&idents[1].value))
+    }
+    fn visit_unary_op(&self, op: &UnaryOperator, expr: &SqlExpr) -> PolarsResult<Expr> {
+        let expr = self.visit_expr(expr)?;
+        Ok(match op {
+            UnaryOperator::Plus => lit(0) + expr,
+            UnaryOperator::Minus => lit(0) - expr,
+            UnaryOperator::Not => expr.not(),
+            other => polars_bail!(ComputeError: "Unary operator {:?} is not supported", other),
+        })
     }
 
     /// Visit a single identifier
@@ -152,11 +147,7 @@ impl SqlExprVisitor {
             SQLBinaryOperator::And => left.and(right),
             SQLBinaryOperator::Or => left.or(right),
             SQLBinaryOperator::Xor => left.xor(right),
-            _ => {
-                return Err(PolarsError::ComputeError(
-                    format!("SQL Operator {:?} was not supported in polars-sql yet!", op).into(),
-                ))
-            }
+            other => polars_bail!(ComputeError: "SQL operator {:?} is not yet supported", other),
         })
     }
 
@@ -166,7 +157,10 @@ impl SqlExprVisitor {
     ///
     /// See [SqlFunctionVisitor] for more details
     fn visit_function(&self, function: &SQLFunction) -> PolarsResult<Expr> {
-        let visitor = SqlFunctionVisitor(function);
+        let visitor = SqlFunctionVisitor {
+            func: function,
+            ctx: self.ctx,
+        };
         visitor.visit_function()
     }
 
@@ -190,14 +184,11 @@ impl SqlExprVisitor {
             SqlValue::Number(s, _) => {
                 // Check for existence of decimal separator dot
                 if s.contains('.') {
-                    s.parse::<f64>().map(lit).map_err(|_| {
-                        PolarsError::ComputeError(format!("Can't parse literal {:?}", s).into())
-                    })
+                    s.parse::<f64>().map(lit).map_err(|_| ())
                 } else {
-                    s.parse::<i64>().map(lit).map_err(|_| {
-                        PolarsError::ComputeError(format!("Can't parse literal {:?}", s).into())
-                    })
-                }?
+                    s.parse::<i64>().map(lit).map_err(|_| ())
+                }
+                .map_err(|_| polars_err!(ComputeError: "cannot parse literal: {:?}"))?
             }
             SqlValue::SingleQuotedString(s) => lit(s.clone()),
             SqlValue::NationalStringLiteral(s) => lit(s.clone()),
@@ -205,15 +196,7 @@ impl SqlExprVisitor {
             SqlValue::DoubleQuotedString(s) => lit(s.clone()),
             SqlValue::Boolean(b) => lit(*b),
             SqlValue::Null => Expr::Literal(LiteralValue::Null),
-            _ => {
-                return Err(PolarsError::ComputeError(
-                    format!(
-                        "Parsing SQL Value {:?} was not supported in polars-sql yet!",
-                        value
-                    )
-                    .into(),
-                ))
-            }
+            other => polars_bail!(ComputeError: "SQL value {:?} is not yet supported", other),
         })
     }
     /// Visit a SQL `BETWEEN` expression
@@ -261,19 +244,50 @@ impl SqlExprVisitor {
         })
     }
 
+    /// Visit a SQL `ARRAY_AGG` expression
+    fn visit_arr_agg(&self, expr: &ArrayAgg) -> PolarsResult<Expr> {
+        let mut base = self.visit_expr(&expr.expr)?;
+
+        if let Some(order_by) = expr.order_by.as_ref() {
+            let (order_by, descending) = self.visit_order_by(order_by)?;
+            base = base.sort_by(vec![order_by], vec![descending]);
+        }
+
+        if let Some(limit) = &expr.limit {
+            let limit = match self.visit_expr(limit)? {
+                Expr::Literal(LiteralValue::UInt32(n)) => n as usize,
+                Expr::Literal(LiteralValue::UInt64(n)) => n as usize,
+                Expr::Literal(LiteralValue::Int32(n)) => n as usize,
+                Expr::Literal(LiteralValue::Int64(n)) => n as usize,
+                _ => polars_bail!(ComputeError: "limit in ARRAY_AGG must be a positive integer"),
+            };
+            base = base.head(Some(limit));
+        }
+
+        if expr.distinct {
+            base = base.unique_stable();
+        }
+
+        polars_ensure!(
+            !expr.within_group,
+            ComputeError: "ARRAY_AGG WITHIN GROUP is not yet supported"
+        );
+        Ok(base.list())
+    }
+
+    fn visit_order_by(&self, order_by: &OrderByExpr) -> PolarsResult<(Expr, bool)> {
+        let expr = self.visit_expr(&order_by.expr)?;
+        let descending = order_by.asc.unwrap_or(false);
+        Ok((expr, descending))
+    }
+
     fn err(&self, expr: &Expr) -> PolarsResult<Expr> {
-        Err(PolarsError::ComputeError(
-            format!(
-                "Expression: {:?} was not supported in polars-sql yet. Please open a feature request.",
-                expr
-            )
-            .into(),
-        ))
+        polars_bail!(ComputeError: "SQL expression {:?} is not yet supported", expr);
     }
 }
 
-pub(crate) fn parse_sql_expr(expr: &SqlExpr) -> PolarsResult<Expr> {
-    let visitor = SqlExprVisitor {};
+pub(crate) fn parse_sql_expr<'a>(expr: &SqlExpr, ctx: &'a SQLContext) -> PolarsResult<Expr> {
+    let visitor = SqlExprVisitor { ctx };
     visitor.visit_expr(expr)
 }
 
@@ -282,38 +296,30 @@ pub(super) fn process_join_constraint(
     left_name: &str,
     right_name: &str,
 ) -> PolarsResult<(Expr, Expr)> {
-    if let JoinConstraint::On(expr) = constraint {
-        if let SqlExpr::BinaryOp { left, op, right } = expr {
-            match (left.as_ref(), right.as_ref()) {
-                (SqlExpr::CompoundIdentifier(left), SqlExpr::CompoundIdentifier(right)) => {
-                    if left.len() == 2 && right.len() == 2 {
-                        let tbl_a = &left[0].value;
-                        let col_a = &left[1].value;
+    if let JoinConstraint::On(SqlExpr::BinaryOp { left, op, right }) = constraint {
+        match (left.as_ref(), right.as_ref()) {
+            (SqlExpr::CompoundIdentifier(left), SqlExpr::CompoundIdentifier(right)) => {
+                if left.len() == 2 && right.len() == 2 {
+                    let tbl_a = &left[0].value;
+                    let col_a = &left[1].value;
 
-                        let tbl_b = &right[0].value;
-                        let col_b = &right[1].value;
+                    let tbl_b = &right[0].value;
+                    let col_b = &right[1].value;
 
-                        if let BinaryOperator::Eq = op {
-                            if left_name == tbl_a && right_name == tbl_b {
-                                return Ok((col(col_a), col(col_b)));
-                            } else if left_name == tbl_b && right_name == tbl_a {
-                                return Ok((col(col_b), col(col_a)));
-                            }
+                    if let BinaryOperator::Eq = op {
+                        if left_name == tbl_a && right_name == tbl_b {
+                            return Ok((col(col_a), col(col_b)));
+                        } else if left_name == tbl_b && right_name == tbl_a {
+                            return Ok((col(col_b), col(col_a)));
                         }
                     }
                 }
-                (SqlExpr::Identifier(left), SqlExpr::Identifier(right)) => {
-                    return Ok((col(&left.value), col(&right.value)))
-                }
-                _ => {}
             }
+            (SqlExpr::Identifier(left), SqlExpr::Identifier(right)) => {
+                return Ok((col(&left.value), col(&right.value)))
+            }
+            _ => {}
         }
     }
-    Err(PolarsError::ComputeError(
-        format!(
-            "Join constraint {:?} not yet supported in polars-sql",
-            constraint
-        )
-        .into(),
-    ))
+    polars_bail!(ComputeError: "SQL join constraint {:?} is not yet supported", constraint);
 }

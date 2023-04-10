@@ -8,6 +8,7 @@ use pyo3::class::basic::CompareOp;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyFloat, PyInt, PyString};
+use smartstring::alias::String as SmartString;
 
 use super::apply::*;
 use crate::conversion::{parse_fill_null_strategy, Wrap};
@@ -249,8 +250,13 @@ impl PyExpr {
     }
 
     #[cfg(feature = "top_k")]
-    pub fn top_k(&self, k: usize, descending: bool) -> PyExpr {
-        self.inner.clone().top_k(k, descending).into()
+    pub fn top_k(&self, k: usize) -> PyExpr {
+        self.inner.clone().top_k(k).into()
+    }
+
+    #[cfg(feature = "top_k")]
+    pub fn bottom_k(&self, k: usize) -> PyExpr {
+        self.inner.clone().bottom_k(k).into()
     }
 
     pub fn arg_max(&self) -> PyExpr {
@@ -563,7 +569,7 @@ impl PyExpr {
             .into()
     }
 
-    #[pyo3(signature = (fmt, strict, exact, cache, tz_aware, utc, tu, tz))]
+    #[pyo3(signature = (fmt, strict, exact, cache, tz_aware, utc, time_unit, time_zone))]
     #[allow(clippy::too_many_arguments)]
     pub fn str_parse_datetime(
         &self,
@@ -573,11 +579,11 @@ impl PyExpr {
         cache: bool,
         tz_aware: bool,
         utc: bool,
-        tu: Option<Wrap<TimeUnit>>,
-        tz: Option<TimeZone>,
+        time_unit: Option<Wrap<TimeUnit>>,
+        time_zone: Option<TimeZone>,
     ) -> PyExpr {
-        let result_tu = match (&fmt, tu) {
-            (_, Some(tu)) => tu.0,
+        let result_time_unit = match (&fmt, time_unit) {
+            (_, Some(time_unit)) => time_unit.0,
             (Some(fmt), None) => {
                 if fmt.contains("%.9f")
                     || fmt.contains("%9f")
@@ -597,7 +603,7 @@ impl PyExpr {
             .clone()
             .str()
             .strptime(StrpTimeOptions {
-                date_dtype: DataType::Datetime(result_tu, tz),
+                date_dtype: DataType::Datetime(result_time_unit, time_zone),
                 fmt,
                 strict,
                 exact,
@@ -688,11 +694,11 @@ impl PyExpr {
     }
 
     #[cfg(feature = "lazy_regex")]
-    pub fn str_replace(&self, pat: PyExpr, val: PyExpr, literal: bool) -> PyExpr {
+    pub fn str_replace_n(&self, pat: PyExpr, val: PyExpr, literal: bool, n: i64) -> PyExpr {
         self.inner
             .clone()
             .str()
-            .replace(pat.inner, val.inner, literal)
+            .replace_n(pat.inner, val.inner, literal, n)
             .into()
     }
 
@@ -761,7 +767,7 @@ impl PyExpr {
             .inner
             .map(
                 move |s| s.utf8()?.hex_decode(strict).map(|s| Some(s.into_series())),
-                GetOutput::same_type(),
+                GetOutput::from_type(DataType::Binary),
             )
             .with_fmt("str.hex_decode")
             .into()
@@ -787,17 +793,17 @@ impl PyExpr {
                         .base64_decode(strict)
                         .map(|s| Some(s.into_series()))
                 },
-                GetOutput::same_type(),
+                GetOutput::from_type(DataType::Binary),
             )
             .with_fmt("str.base64_decode")
             .into()
     }
 
-    pub fn str_parse_int(&self, radix: Option<u32>) -> PyExpr {
+    pub fn str_parse_int(&self, radix: u32, strict: bool) -> PyExpr {
         self.inner
             .clone()
             .str()
-            .from_radix(radix)
+            .from_radix(radix, strict)
             .with_fmt("str.parse_int")
             .into()
     }
@@ -808,7 +814,7 @@ impl PyExpr {
             .inner
             .map(
                 move |s| s.binary().map(|s| Some(s.hex_encode().into_series())),
-                GetOutput::same_type(),
+                GetOutput::from_type(DataType::Utf8),
             )
             .with_fmt("binary.hex_encode")
             .into()
@@ -835,7 +841,7 @@ impl PyExpr {
             .inner
             .map(
                 move |s| s.binary().map(|s| Some(s.base64_encode().into_series())),
-                GetOutput::same_type(),
+                GetOutput::from_type(DataType::Utf8),
             )
             .with_fmt("binary.base64_encode")
             .into()
@@ -941,6 +947,9 @@ impl PyExpr {
     pub fn year(&self) -> PyExpr {
         self.clone().inner.dt().year().into()
     }
+    pub fn is_leap_year(&self) -> PyExpr {
+        self.clone().inner.dt().is_leap_year().into()
+    }
     pub fn iso_year(&self) -> PyExpr {
         self.clone().inner.dt().iso_year().into()
     }
@@ -961,6 +970,15 @@ impl PyExpr {
     }
     pub fn ordinal_day(&self) -> PyExpr {
         self.clone().inner.dt().ordinal_day().into()
+    }
+    pub fn time(&self) -> PyExpr {
+        self.clone().inner.dt().time().into()
+    }
+    pub fn date(&self) -> PyExpr {
+        self.clone().inner.dt().date().into()
+    }
+    pub fn datetime(&self) -> PyExpr {
+        self.clone().inner.dt().datetime().into()
     }
     pub fn hour(&self) -> PyExpr {
         self.clone().inner.dt().hour().into()
@@ -1043,8 +1061,8 @@ impl PyExpr {
             )
             .into()
     }
-    pub fn timestamp(&self, tu: Wrap<TimeUnit>) -> PyExpr {
-        self.inner.clone().dt().timestamp(tu.0).into()
+    pub fn timestamp(&self, time_unit: Wrap<TimeUnit>) -> PyExpr {
+        self.inner.clone().dt().timestamp(time_unit.0).into()
     }
 
     pub fn dt_offset_by(&self, by: &str) -> PyExpr {
@@ -1065,28 +1083,28 @@ impl PyExpr {
             .into()
     }
 
-    pub fn dt_with_time_unit(&self, tu: Wrap<TimeUnit>) -> PyExpr {
-        self.inner.clone().dt().with_time_unit(tu.0).into()
+    pub fn dt_with_time_unit(&self, time_unit: Wrap<TimeUnit>) -> PyExpr {
+        self.inner.clone().dt().with_time_unit(time_unit.0).into()
     }
 
     #[cfg(feature = "timezones")]
-    pub fn dt_convert_time_zone(&self, tz: TimeZone) -> PyExpr {
-        self.inner.clone().dt().convert_time_zone(tz).into()
+    pub fn dt_convert_time_zone(&self, time_zone: TimeZone) -> PyExpr {
+        self.inner.clone().dt().convert_time_zone(time_zone).into()
     }
 
-    pub fn dt_cast_time_unit(&self, tu: Wrap<TimeUnit>) -> PyExpr {
-        self.inner.clone().dt().cast_time_unit(tu.0).into()
+    pub fn dt_cast_time_unit(&self, time_unit: Wrap<TimeUnit>) -> PyExpr {
+        self.inner.clone().dt().cast_time_unit(time_unit.0).into()
     }
 
     #[cfg(feature = "timezones")]
-    pub fn dt_replace_time_zone(&self, tz: Option<String>) -> PyExpr {
-        self.inner.clone().dt().replace_time_zone(tz).into()
+    pub fn dt_replace_time_zone(&self, time_zone: Option<String>) -> PyExpr {
+        self.inner.clone().dt().replace_time_zone(time_zone).into()
     }
 
     #[cfg(feature = "timezones")]
     #[allow(deprecated)]
-    pub fn dt_tz_localize(&self, tz: String) -> PyExpr {
-        self.inner.clone().dt().tz_localize(tz).into()
+    pub fn dt_tz_localize(&self, time_zone: String) -> PyExpr {
+        self.inner.clone().dt().tz_localize(time_zone).into()
     }
 
     pub fn dt_truncate(&self, every: &str, offset: &str) -> PyExpr {
@@ -1097,8 +1115,12 @@ impl PyExpr {
         self.inner.clone().dt().round(every, offset).into()
     }
 
-    pub fn dt_combine(&self, time: PyExpr, tu: Wrap<TimeUnit>) -> PyExpr {
-        self.inner.clone().dt().combine(time.inner, tu.0).into()
+    pub fn dt_combine(&self, time: PyExpr, time_unit: Wrap<TimeUnit>) -> PyExpr {
+        self.inner
+            .clone()
+            .dt()
+            .combine(time.inner, time_unit.0)
+            .into()
     }
 
     #[pyo3(signature = (lambda, window_size, weights, min_periods, center))]
@@ -1520,21 +1542,17 @@ impl PyExpr {
     }
 
     fn lst_reverse(&self) -> Self {
-        self.inner
-            .clone()
-            .arr()
-            .reverse()
-            .with_fmt("arr.reverse")
-            .into()
+        self.inner.clone().arr().reverse().into()
     }
 
-    fn lst_unique(&self) -> Self {
-        self.inner
-            .clone()
-            .arr()
-            .unique()
-            .with_fmt("arr.unique")
-            .into()
+    fn lst_unique(&self, maintain_order: bool) -> Self {
+        let e = self.inner.clone();
+
+        if maintain_order {
+            e.arr().unique_stable().into()
+        } else {
+            e.arr().unique().into()
+        }
     }
 
     fn lst_get(&self, index: PyExpr) -> Self {
@@ -1605,7 +1623,8 @@ impl PyExpr {
             Arc::new(move |idx: usize| {
                 Python::with_gil(|py| {
                     let out = lambda.call1(py, (idx,)).unwrap();
-                    out.extract::<String>(py).unwrap()
+                    let out: SmartString = out.extract::<&str>(py).unwrap().into();
+                    out
                 })
             }) as NameGenerator
         });
@@ -1618,12 +1637,12 @@ impl PyExpr {
             .into())
     }
 
-    fn rank(&self, method: Wrap<RankMethod>, descending: bool) -> Self {
+    fn rank(&self, method: Wrap<RankMethod>, descending: bool, seed: Option<u64>) -> Self {
         let options = RankOptions {
             method: method.0,
             descending,
         };
-        self.inner.clone().rank(options).into()
+        self.inner.clone().rank(options, seed).into()
     }
 
     fn diff(&self, n: usize, null_behavior: Wrap<NullBehavior>) -> Self {
@@ -1991,6 +2010,8 @@ pub fn lit(value: &PyAny, allow_object: bool) -> PyResult<PyExpr> {
         Ok(dsl::lit(series.series).into())
     } else if value.is_none() {
         Ok(dsl::lit(Null {}).into())
+    } else if let Ok(value) = value.downcast::<PyBytes>() {
+        Ok(dsl::lit(value.as_bytes()).into())
     } else if allow_object {
         let s = Python::with_gil(|py| {
             PySeries::new_object("", vec![ObjectValue::from(value.into_py(py))], false).series

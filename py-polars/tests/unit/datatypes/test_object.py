@@ -62,10 +62,33 @@ def test_empty_sort() -> None:
         ],
         orient="row",
     )
-    df_filtered = df.filter(pl.col("blob").apply(lambda blob: blob["name"] == "baz"))
-    df_filtered.sort(pl.col("blob").apply(lambda blob: blob["sort_key"]))
+    df_filtered = df.filter(
+        pl.col("blob").apply(
+            lambda blob: blob["name"] == "baz", return_dtype=pl.Boolean
+        )
+    )
+    df_filtered.sort(
+        pl.col("blob").apply(lambda blob: blob["sort_key"], return_dtype=pl.Int64)
+    )
 
 
 def test_object_to_dicts() -> None:
     df = pl.DataFrame({"d": [{"a": 1, "b": 2, "c": 3}]}, schema={"d": pl.Object})
     assert df.to_dicts() == [{"d": {"a": 1, "b": 2, "c": 3}}]
+
+
+def test_object_concat() -> None:
+    df1 = pl.DataFrame(
+        {"a": [1, 2, 3]},
+        schema={"a": pl.Object},
+    )
+
+    df2 = pl.DataFrame(
+        {"a": [1, 4, 3]},
+        schema={"a": pl.Object},
+    )
+
+    catted = pl.concat([df1, df2])
+    assert catted.shape == (6, 1)
+    assert catted.dtypes == [pl.Object]
+    assert catted.to_dict(False) == {"a": [1, 2, 3, 1, 4, 3]}

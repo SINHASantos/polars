@@ -1,4 +1,5 @@
 use numpy::PyArray1;
+use polars_algo::{cut, hist, qcut};
 use polars_core::prelude::QuantileInterpolOptions;
 use polars_core::series::IsSorted;
 use polars_core::utils::{flatten_series, CustomIterTools};
@@ -13,8 +14,9 @@ use crate::dataframe::PyDataFrame;
 use crate::error::PyPolarsErr;
 use crate::list_construction::py_seq_to_list;
 use crate::prelude::*;
+use crate::py_modules::POLARS;
 use crate::set::set_at_idx;
-use crate::{apply_method_all_arrow_series2, arrow_interop};
+use crate::{apply_method_all_arrow_series2, arrow_interop, raise_err};
 
 #[pyclass]
 #[repr(transparent)]
@@ -224,10 +226,14 @@ impl From<Series> for PySeries {
 )]
 impl PySeries {
     #[staticmethod]
-    pub fn new_from_anyvalues(name: &str, val: Vec<Wrap<AnyValue<'_>>>) -> PyResult<PySeries> {
+    pub fn new_from_anyvalues(
+        name: &str,
+        val: Vec<Wrap<AnyValue<'_>>>,
+        strict: bool,
+    ) -> PyResult<PySeries> {
         let avs = slice_extract_wrapped(&val);
         // from anyvalues is fallible
-        let s = Series::from_any_values(name, avs).map_err(PyPolarsErr::from)?;
+        let s = Series::from_any_values(name, avs, strict).map_err(PyPolarsErr::from)?;
         Ok(s.into())
     }
 
@@ -255,6 +261,8 @@ impl PySeries {
     pub fn new_object(name: &str, val: Vec<ObjectValue>, _strict: bool) -> Self {
         #[cfg(feature = "object")]
         {
+            // object builder must be registered.
+            crate::object::register_object_builder();
             let s = ObjectChunked::<ObjectValue>::new_from_vec(name, val).into_series();
             s.into()
         }
@@ -268,6 +276,21 @@ impl PySeries {
     pub fn new_series_list(name: &str, val: Vec<Self>, _strict: bool) -> Self {
         let series_vec = to_series_collection(val);
         Series::new(name, &series_vec).into()
+    }
+
+    #[staticmethod]
+    pub fn new_decimal(
+        name: &str,
+        val: Vec<Wrap<AnyValue<'_>>>,
+        strict: bool,
+    ) -> PyResult<PySeries> {
+        // TODO: do we have to respect 'strict' here? it's possible if we want to
+        let avs = slice_extract_wrapped(&val);
+        // create a fake dtype with a placeholder "none" scale, to be inferred later
+        let dtype = DataType::Decimal(None, None);
+        let s = Series::from_any_values_and_dtype(name, avs, &dtype, strict)
+            .map_err(PyPolarsErr::from)?;
+        Ok(s.into())
     }
 
     #[staticmethod]
@@ -285,6 +308,12 @@ impl PySeries {
                 ca.rename(name);
                 ca.into_inner().into_series().into()
             }
+            DataType::Int32 => {
+                let val = val.extract::<i32>().unwrap();
+                let mut ca: NoNull<Int32Chunked> = (0..n).map(|_| val).collect_trusted();
+                ca.rename(name);
+                ca.into_inner().into_series().into()
+            }
             DataType::Float64 => {
                 let val = val.extract::<f64>().unwrap();
                 let mut ca: NoNull<Float64Chunked> = (0..n).map(|_| val).collect_trusted();
@@ -296,6 +325,10 @@ impl PySeries {
                 let mut ca: BooleanChunked = (0..n).map(|_| val).collect_trusted();
                 ca.rename(name);
                 ca.into_series().into()
+            }
+            DataType::Null => {
+                let s = Series::new_null(name, n);
+                PySeries::new(s)
             }
             dt => {
                 panic!("cannot create repeat with dtype: {dt:?}");
@@ -367,7 +400,7 @@ impl PySeries {
             if val == v_trunc {
                 val
             } else {
-                format!("{v_trunc}...")
+                format!("{v_trunc}…")
             }
         } else {
             val
@@ -385,7 +418,19 @@ impl PySeries {
     }
 
     pub fn get_idx(&self, py: Python, idx: usize) -> PyResult<PyObject> {
-        Ok(Wrap(self.series.get(idx).map_err(PyPolarsErr::from)?).into_py(py))
+        let av = self.series.get(idx).map_err(PyPolarsErr::from)?;
+        if let AnyValue::List(s) = av {
+            let pyseries = PySeries::new(s);
+            let out = POLARS
+                .getattr(py, "wrap_s")
+                .unwrap()
+                .call1(py, (pyseries,))
+                .unwrap();
+
+            Ok(out.into_py(py))
+        } else {
+            Ok(Wrap(self.series.get(idx).map_err(PyPolarsErr::from)?).into_py(py))
+        }
     }
 
     pub fn bitand(&self, other: &PySeries) -> PyResult<Self> {
@@ -650,7 +695,6 @@ impl PySeries {
                     DataType::Int64 => PyList::new(py, series.i64().unwrap()),
                     DataType::Float32 => PyList::new(py, series.f32().unwrap()),
                     DataType::Float64 => PyList::new(py, series.f64().unwrap()),
-                    DataType::Decimal128(_) => todo!(),
                     DataType::Categorical(_) => {
                         PyList::new(py, series.categorical().unwrap().iter_str())
                     }
@@ -692,6 +736,10 @@ impl PySeries {
                     }
                     DataType::Datetime(_, _) => {
                         let ca = series.datetime().unwrap();
+                        return Wrap(ca).to_object(py);
+                    }
+                    DataType::Decimal(_, _) => {
+                        let ca = series.decimal().unwrap();
                         return Wrap(ca).to_object(py);
                     }
                     DataType::Utf8 => {
@@ -799,47 +847,61 @@ impl PySeries {
         output_type: Option<Wrap<DataType>>,
         skip_nulls: bool,
     ) -> PyResult<PySeries> {
-        Python::with_gil(|py| {
-            let series = &self.series;
+        let series = &self.series;
 
-            let output_type = output_type.map(|dt| dt.0);
+        if skip_nulls && (series.null_count() == series.len()) {
+            if let Some(output_type) = output_type {
+                return Ok(Series::full_null(series.name(), series.len(), &output_type.0).into());
+            }
+            let msg = "The output type of 'apply' function cannot determined.\n\
+            The function was never called because 'skip_nulls=True' and all values are null.\n\
+            Consider setting 'skip_nulls=False' or setting the 'return_dtype'.";
+            raise_err!(msg, ComputeError)
+        }
 
-            macro_rules! dispatch_apply {
-                ($self:expr, $method:ident, $($args:expr),*) => {
-                    match $self.dtype() {
-                        #[cfg(feature = "object")]
-                        DataType::Object(_) => {
-                            let ca = $self.0.unpack::<ObjectType<ObjectValue>>().unwrap();
-                            ca.$method($($args),*)
-                        },
-                        _ => {
-                            apply_method_all_arrow_series2!(
-                                $self,
-                                $method,
-                                $($args),*
-                            )
-                        }
+        let output_type = output_type.map(|dt| dt.0);
 
+        macro_rules! dispatch_apply {
+            ($self:expr, $method:ident, $($args:expr),*) => {
+                match $self.dtype() {
+                    #[cfg(feature = "object")]
+                    DataType::Object(_) => {
+                        let ca = $self.0.unpack::<ObjectType<ObjectValue>>().unwrap();
+                        ca.$method($($args),*)
+                    },
+                    _ => {
+                        apply_method_all_arrow_series2!(
+                            $self,
+                            $method,
+                            $($args),*
+                        )
                     }
-                }
 
+                }
             }
 
+        }
+
+        Python::with_gil(|py| {
             if matches!(
                 self.series.dtype(),
                 DataType::Datetime(_, _)
                     | DataType::Date
                     | DataType::Duration(_)
                     | DataType::Categorical(_)
+                    | DataType::Binary
                     | DataType::Time
             ) || !skip_nulls
             {
                 let mut avs = Vec::with_capacity(self.series.len());
-                let iter = self.series.iter().map(|av| {
-                    let input = Wrap(av);
-                    call_lambda_and_extract::<_, Wrap<AnyValue>>(py, lambda, input)
-                        .unwrap()
-                        .0
+                let iter = self.series.iter().map(|av| match (skip_nulls, av) {
+                    (true, AnyValue::Null) => AnyValue::Null,
+                    (_, av) => {
+                        let input = Wrap(av);
+                        call_lambda_and_extract::<_, Wrap<AnyValue>>(py, lambda, input)
+                            .unwrap()
+                            .0
+                    }
                 });
                 avs.extend(iter);
                 return Ok(Series::new(self.name(), &avs).into());
@@ -1031,8 +1093,11 @@ impl PySeries {
         Ok(PySeries::new(s))
     }
 
-    pub fn to_dummies(&self, sep: Option<&str>) -> PyResult<PyDataFrame> {
-        let df = self.series.to_dummies(sep).map_err(PyPolarsErr::from)?;
+    pub fn to_dummies(&self, separator: Option<&str>) -> PyResult<PyDataFrame> {
+        let df = self
+            .series
+            .to_dummies(separator)
+            .map_err(PyPolarsErr::from)?;
         Ok(df.into())
     }
 
@@ -1112,8 +1177,10 @@ impl PySeries {
     }
 
     pub fn time_unit(&self) -> Option<&str> {
-        if let DataType::Datetime(tu, _) | DataType::Duration(tu) = self.series.dtype() {
-            Some(match tu {
+        if let DataType::Datetime(time_unit, _) | DataType::Duration(time_unit) =
+            self.series.dtype()
+        {
+            Some(match time_unit {
                 TimeUnit::Nanoseconds => "ns",
                 TimeUnit::Microseconds => "us",
                 TimeUnit::Milliseconds => "ms",
@@ -1152,6 +1219,66 @@ impl PySeries {
             multithreaded: true,
         };
         self.series.is_sorted(options)
+    }
+
+    pub fn clear(&self) -> Self {
+        self.series.clear().into()
+    }
+
+    #[pyo3(signature = (bins, labels, break_point_label, category_label, maintain_order))]
+    pub fn cut(
+        &self,
+        bins: Self,
+        labels: Option<Vec<&str>>,
+        break_point_label: Option<&str>,
+        category_label: Option<&str>,
+        maintain_order: bool,
+    ) -> PyResult<PyDataFrame> {
+        let out = cut(
+            &self.series,
+            bins.series,
+            labels,
+            break_point_label,
+            category_label,
+            maintain_order,
+        )
+        .map_err(PyPolarsErr::from)?;
+        Ok(out.into())
+    }
+
+    #[pyo3(signature = (quantiles, labels, break_point_label, category_label, maintain_order))]
+    pub fn qcut(
+        &self,
+        quantiles: Self,
+        labels: Option<Vec<&str>>,
+        break_point_label: Option<&str>,
+        category_label: Option<&str>,
+        maintain_order: bool,
+    ) -> PyResult<PyDataFrame> {
+        if quantiles.series.null_count() > 0 {
+            return Err(PyValueError::new_err(
+                "did not expect null values in list of quantiles",
+            ));
+        }
+        let quantiles = quantiles.series.cast(&DataType::Float64).unwrap();
+        let quantiles = quantiles.f64().unwrap().rechunk();
+
+        let out = qcut(
+            &self.series,
+            quantiles.cont_slice().unwrap(),
+            labels,
+            break_point_label,
+            category_label,
+            maintain_order,
+        )
+        .map_err(PyPolarsErr::from)?;
+        Ok(out.into())
+    }
+
+    pub fn hist(&self, bins: Option<Self>, bin_count: Option<usize>) -> PyResult<PyDataFrame> {
+        let bins = bins.map(|s| s.series);
+        let out = hist(&self.series, bins.as_ref(), bin_count).map_err(PyPolarsErr::from)?;
+        Ok(out.into())
     }
 }
 

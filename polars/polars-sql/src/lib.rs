@@ -1,3 +1,5 @@
+//! # Polars SQL
+#![deny(missing_docs)]
 mod context;
 mod functions;
 mod sql_expr;
@@ -7,6 +9,7 @@ pub use context::SQLContext;
 #[cfg(test)]
 mod test {
     use polars_core::prelude::*;
+    use polars_lazy::dsl::lit;
     use polars_lazy::prelude::*;
 
     use super::*;
@@ -20,7 +23,7 @@ mod test {
     #[test]
     fn test_simple_select() -> PolarsResult<()> {
         let df = create_sample_df()?;
-        let mut context = SQLContext::try_new()?;
+        let mut context = SQLContext::new();
         context.register("df", df.clone().lazy());
         let df_sql = context
             .execute(
@@ -45,7 +48,7 @@ mod test {
     #[test]
     fn test_nested_expr() -> PolarsResult<()> {
         let df = create_sample_df()?;
-        let mut context = SQLContext::try_new()?;
+        let mut context = SQLContext::new();
         context.register("df", df.clone().lazy());
         let df_sql = context
             .execute(r#"SELECT * FROM df WHERE (a > 3)"#)?
@@ -58,7 +61,7 @@ mod test {
     #[test]
     fn test_groupby_simple() -> PolarsResult<()> {
         let df = create_sample_df()?;
-        let mut context = SQLContext::try_new()?;
+        let mut context = SQLContext::new();
         context.register("df", df.clone().lazy());
         let df_sql = context
             .execute(
@@ -103,7 +106,7 @@ mod test {
     #[test]
     fn test_cast_exprs() {
         let df = create_sample_df().unwrap();
-        let mut context = SQLContext::try_new().unwrap();
+        let mut context = SQLContext::new();
         context.register("df", df.clone().lazy());
         let sql = r#"
             SELECT 
@@ -129,7 +132,7 @@ mod test {
     #[test]
     fn test_literal_exprs() {
         let df = create_sample_df().unwrap();
-        let mut context = SQLContext::try_new().unwrap();
+        let mut context = SQLContext::new();
         context.register("df", df.clone().lazy());
         let sql = r#"
             SELECT 
@@ -153,10 +156,11 @@ mod test {
             .unwrap();
         assert!(df_sql.frame_equal_missing(&df_pl));
     }
+
     #[test]
     fn test_prefixed_column_names() {
         let df = create_sample_df().unwrap();
-        let mut context = SQLContext::try_new().unwrap();
+        let mut context = SQLContext::new();
         context.register("df", df.clone().lazy());
         let sql = r#"
             SELECT 
@@ -175,7 +179,7 @@ mod test {
     #[test]
     fn test_prefixed_column_names_2() {
         let df = create_sample_df().unwrap();
-        let mut context = SQLContext::try_new().unwrap();
+        let mut context = SQLContext::new();
         context.register("df", df.clone().lazy());
         let sql = r#"
             SELECT 
@@ -193,7 +197,7 @@ mod test {
     #[test]
     fn test_binary_functions() {
         let df = create_sample_df().unwrap();
-        let mut context = SQLContext::try_new().unwrap();
+        let mut context = SQLContext::new();
         context.register("df", df.clone().lazy());
         let sql = r#"
             SELECT 
@@ -242,7 +246,7 @@ mod test {
     #[test]
     fn test_null_exprs() {
         let df = create_sample_df().unwrap();
-        let mut context = SQLContext::try_new().unwrap();
+        let mut context = SQLContext::new();
         context.register("df", df.clone().lazy());
         let sql = r#"
             SELECT 
@@ -277,7 +281,7 @@ mod test {
         }
         .unwrap();
 
-        let mut context = SQLContext::try_new().unwrap();
+        let mut context = SQLContext::new();
         context.register("df", df.clone().lazy());
         let sql = r#"
             SELECT 
@@ -298,40 +302,68 @@ mod test {
     #[test]
     fn test_math_functions() {
         let df = df! {
-            "a" => &[1.0]
+            "a" => [1.0]
         }
         .unwrap();
-        let mut context = SQLContext::try_new().unwrap();
+        let mut context = SQLContext::new();
         context.register("df", df.clone().lazy());
         let sql = r#"
             SELECT 
                 a, 
-                abs(a) as abs_a,
-                exp(a) as exp_a,
-                floor(a) as floor_a,
-                ln(a) as ln_a,
-                acos(a) as acos_a,
-                asin(a) as asin_a,
-                atan(a) as atan_a,
-                log(a, 10) as log_a,
-                log2(a) as log2_a,
-                log10(a) as log10_a
+                ABS(a) AS abs,
+                ACOS(a) AS acos,
+                ASIN(a) AS asin,
+                ATAN(a) AS atan,
+                CEIL(a) AS ceil,
+                EXP(a) AS exp,
+                FLOOR(a) AS floor,
+                LN(a) AS ln,
+                LOG2(a) AS log2,
+                LOG10(a) AS log10,
+                LOG(a, 5) AS log5,
+                POW(a, 2) AS pow
             FROM df"#;
         let df_sql = context.execute(sql).unwrap().collect().unwrap();
         let df_pl = df
             .lazy()
             .select(&[
                 col("a"),
-                col("a").abs().alias("abs_a"),
-                col("a").exp().alias("exp_a"),
-                col("a").floor().alias("floor_a"),
-                col("a").log(std::f64::consts::E).alias("ln_a"),
-                col("a").arccos().alias("acos_a"),
-                col("a").arcsin().alias("asin_a"),
-                col("a").arctan().alias("atan_a"),
-                col("a").log(10.0).alias("log_a"),
-                col("a").log(2.0).alias("log2_a"),
-                col("a").log(10.0).alias("log10_a"),
+                col("a").abs().alias("abs"),
+                col("a").arccos().alias("acos"),
+                col("a").arcsin().alias("asin"),
+                col("a").arctan().alias("atan"),
+                col("a").ceil().alias("ceil"),
+                col("a").exp().alias("exp"),
+                col("a").floor().alias("floor"),
+                col("a").log(std::f64::consts::E).alias("ln"),
+                col("a").log(2.0).alias("log2"),
+                col("a").log(10.0).alias("log10"),
+                col("a").log(5.0).alias("log5"),
+                col("a").pow(2.0).alias("pow"),
+            ])
+            .collect()
+            .unwrap();
+        assert!(df_sql.frame_equal_missing(&df_pl));
+    }
+
+    #[test]
+    fn test_iss_7440() {
+        let df = df! {
+            "a" => [2.0, -2.5]
+        }
+        .unwrap()
+        .lazy();
+        let sql = r#"SELECT a, FLOOR(a) AS floor, CEIL(a) AS ceil FROM df"#;
+        let mut context = SQLContext::new();
+        context.register("df", df.clone());
+
+        let df_sql = context.execute(sql).unwrap().collect().unwrap();
+
+        let df_pl = df
+            .select(&[
+                col("a"),
+                col("a").floor().alias("floor"),
+                col("a").ceil().alias("ceil"),
             ])
             .collect()
             .unwrap();
@@ -343,7 +375,7 @@ mod test {
             "a" => &["foo", "xxxbarxxx", "---bazyyy"]
         }
         .unwrap();
-        let mut context = SQLContext::try_new().unwrap();
+        let mut context = SQLContext::new();
         context.register("df", df.clone().lazy());
         let sql = r#"
             SELECT 
@@ -418,7 +450,7 @@ mod test {
     #[test]
     fn test_agg_functions() {
         let df = create_sample_df().unwrap();
-        let mut context = SQLContext::try_new().unwrap();
+        let mut context = SQLContext::new();
         context.register("df", df.clone().lazy());
         let sql = r#"
             SELECT 
@@ -456,11 +488,10 @@ mod test {
             .unwrap();
         assert!(df_sql.frame_equal(&df_pl));
     }
-
     #[test]
     fn create_table() {
         let df = create_sample_df().unwrap();
-        let mut context = SQLContext::try_new().unwrap();
+        let mut context = SQLContext::new();
         context.register("df", df.clone().lazy());
         let sql = r#"
             CREATE TABLE df2 AS
@@ -479,14 +510,95 @@ mod test {
             .unwrap();
         let expected = df.lazy().select(&[col("a")]).collect().unwrap();
 
-        println!("{df_sql}");
         assert!(df_2.frame_equal(&expected));
+    }
+    #[test]
+    fn test_unary_minus_0() {
+        let df = df! {
+            "value" => [-5, -3, 0, 3, 5],
+        }
+        .unwrap();
+
+        let mut context = SQLContext::new();
+        context.register("df", df.clone().lazy());
+        let sql = r#"SELECT * FROM df WHERE value < -1"#;
+        let df_sql = context.execute(sql).unwrap().collect().unwrap();
+        let df_pl = df
+            .lazy()
+            .filter(col("value").lt(lit(-1)))
+            .collect()
+            .unwrap();
+        assert!(df_sql.frame_equal(&df_pl));
+    }
+    #[test]
+    fn test_unary_minus_1() {
+        let df = df! {
+            "value" => [-5, -3, 0, 3, 5],
+        }
+        .unwrap();
+
+        let mut context = SQLContext::new();
+        context.register("df", df.clone().lazy());
+        let sql = r#"SELECT * FROM df WHERE -value < 1"#;
+        let df_sql = context.execute(sql).unwrap().collect().unwrap();
+        let neg_value = lit(0) - col("value");
+        let df_pl = df.lazy().filter(neg_value.lt(lit(1))).collect().unwrap();
+        assert!(df_sql.frame_equal(&df_pl));
+    }
+
+    fn assert_sql_to_polars(df: &DataFrame, sql: &str, f: impl FnOnce(LazyFrame) -> LazyFrame) {
+        let mut context = SQLContext::new();
+        context.register("df", df.clone().lazy());
+        let df_sql = context.execute(sql).unwrap().collect().unwrap();
+        let df_pl = f(df.clone().lazy()).collect().unwrap();
+        assert!(df_sql.frame_equal(&df_pl));
+    }
+
+    #[test]
+    fn test_arr_agg() {
+        let df = create_sample_df().unwrap();
+        let exprs = vec![
+            (
+                "SELECT ARRAY_AGG(a) AS a FROM df",
+                vec![col("a").list().alias("a")],
+            ),
+            (
+                "SELECT ARRAY_AGG(a) AS a, ARRAY_AGG(b) as b FROM df",
+                vec![col("a").list().alias("a"), col("b").list().alias("b")],
+            ),
+            (
+                "SELECT ARRAY_AGG(a ORDER BY a) AS a FROM df",
+                vec![col("a")
+                    .sort_by(vec![col("a")], vec![false])
+                    .list()
+                    .alias("a")],
+            ),
+            (
+                "SELECT ARRAY_AGG(a) AS a FROM df",
+                vec![col("a").list().alias("a")],
+            ),
+            (
+                "SELECT unnest(ARRAY_AGG(DISTINCT a)) FROM df",
+                vec![col("a").unique_stable().list().explode().alias("a")],
+            ),
+            (
+                "SELECT ARRAY_AGG(a ORDER BY b LIMIT 2) FROM df",
+                vec![col("a")
+                    .sort_by(vec![col("b")], vec![false])
+                    .head(Some(2))
+                    .list()],
+            ),
+        ];
+
+        for (sql, expr) in exprs {
+            assert_sql_to_polars(&df, sql, |df| df.select(&expr));
+        }
     }
 
     #[test]
     #[cfg(feature = "csv")]
     fn read_csv_tbl_func() {
-        let mut context = SQLContext::try_new().unwrap();
+        let mut context = SQLContext::new();
         let sql = r#"
             CREATE TABLE foods1 AS
             SELECT *
@@ -508,7 +620,7 @@ mod test {
     #[test]
     #[cfg(feature = "csv")]
     fn read_csv_tbl_func_inline() {
-        let mut context = SQLContext::try_new().unwrap();
+        let mut context = SQLContext::new();
         let sql = r#"
             SELECT foods1.category
             FROM read_csv('../../examples/datasets/foods1.csv') as foods1"#;
@@ -525,7 +637,7 @@ mod test {
     #[test]
     #[cfg(feature = "csv")]
     fn read_csv_tbl_func_inline_2() {
-        let mut context = SQLContext::try_new().unwrap();
+        let mut context = SQLContext::new();
         let sql = r#"
             SELECT category
             FROM read_csv('../../examples/datasets/foods1.csv')"#;
@@ -543,7 +655,7 @@ mod test {
     #[test]
     #[cfg(feature = "parquet")]
     fn read_parquet_tbl() {
-        let mut context = SQLContext::try_new().unwrap();
+        let mut context = SQLContext::new();
         let sql = r#"
             CREATE TABLE foods1 AS
             SELECT *
@@ -565,7 +677,7 @@ mod test {
     #[test]
     #[cfg(feature = "ipc")]
     fn read_ipc_tbl() {
-        let mut context = SQLContext::try_new().unwrap();
+        let mut context = SQLContext::new();
         let sql = r#"
             CREATE TABLE foods1 AS
             SELECT *
@@ -583,5 +695,118 @@ mod test {
             .unwrap();
         assert_eq!(df_2.height(), 27);
         assert_eq!(df_2.width(), 4);
+    }
+
+    #[test]
+    #[cfg(feature = "csv")]
+    fn iss_7436() {
+        let mut context = SQLContext::new();
+        let sql = r#"
+            CREATE TABLE foods AS
+            SELECT *
+            FROM read_csv('../../examples/datasets/foods1.csv')"#;
+        context.execute(sql).unwrap().collect().unwrap();
+        let df_sql = context
+            .execute(
+                r#"
+            SELECT 
+                "fats_g" AS fats,
+                AVG(calories) OVER (PARTITION BY "category") AS avg_calories_by_category
+            FROM foods
+            LIMIT 5
+            "#,
+            )
+            .unwrap()
+            .collect()
+            .unwrap();
+        let expected = LazyCsvReader::new("../../examples/datasets/foods1.csv")
+            .finish()
+            .unwrap()
+            .select(&[
+                col("fats_g").alias("fats"),
+                col("calories")
+                    .mean()
+                    .over(vec![col("category")])
+                    .alias("avg_calories_by_category"),
+            ])
+            .limit(5)
+            .collect()
+            .unwrap();
+        assert!(df_sql.frame_equal(&expected));
+    }
+
+    #[test]
+    #[cfg(feature = "csv")]
+    fn iss_7437() -> PolarsResult<()> {
+        let mut context = SQLContext::new();
+        let sql = r#"
+            CREATE TABLE foods AS
+            SELECT *
+            FROM read_csv('../../examples/datasets/foods1.csv')"#;
+        context.execute(sql)?.collect()?;
+
+        let df_sql = context
+            .execute(
+                r#"
+                SELECT "category" as category
+                FROM foods
+                GROUP BY "category"
+        "#,
+            )?
+            .collect()?
+            .sort(&["category"], vec![false])?;
+
+        let expected = LazyCsvReader::new("../../examples/datasets/foods1.csv")
+            .finish()?
+            .groupby(vec![col("category").alias("category")])
+            .agg(vec![])
+            .collect()?
+            .sort(&["category"], vec![false])?;
+
+        assert!(df_sql.frame_equal(&expected));
+        Ok(())
+    }
+    #[test]
+    #[cfg(feature = "ipc")]
+    fn test_groupby_2() -> PolarsResult<()> {
+        let mut context = SQLContext::new();
+        let sql = r#"
+        CREATE TABLE foods AS
+        SELECT *
+        FROM read_ipc('../../examples/datasets/foods1.ipc')"#;
+
+        context.execute(sql)?.collect()?;
+        let sql = r#"   
+        SELECT
+            category,
+            count(category) as count,
+            max(calories),
+            min(fats_g)
+        FROM foods
+        GROUP BY category
+        ORDER BY count, category DESC
+        LIMIT 2"#;
+
+        let df_sql = context.execute(sql)?;
+        let df_sql = df_sql.collect()?;
+        let expected =
+            LazyFrame::scan_ipc("../../examples/datasets/foods1.ipc", Default::default())?
+                .select(&[col("*")])
+                .groupby(vec![col("category")])
+                .agg(vec![
+                    col("category").count().alias("count"),
+                    col("calories").max(),
+                    col("fats_g").min(),
+                ])
+                .sort_by_exprs(
+                    vec![col("count"), col("category")],
+                    vec![false, true],
+                    false,
+                )
+                .limit(2);
+        let lp = expected.clone().describe_optimized_plan()?;
+        let expected = expected.collect()?;
+        assert!(df_sql.frame_equal(&expected));
+        Ok(())
     }
 }

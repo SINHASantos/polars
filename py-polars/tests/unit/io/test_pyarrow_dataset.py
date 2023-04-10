@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import sys
 import tempfile
 import typing
+from datetime import date, datetime, time
 from pathlib import Path
 
 import pyarrow.dataset as ds
@@ -17,11 +17,11 @@ def helper_dataset_test(file_path: Path, query) -> None:
     dset = ds.dataset(file_path, format="ipc")
 
     expected = query(pl.scan_ipc(file_path))
-    out = query(pl.scan_ds(dset))
+    out = query(pl.scan_pyarrow_dataset(dset))
     assert_frame_equal(out, expected)
 
 
-@pytest.mark.xfail(sys.platform == "win32", reason="Does not work on Windows")
+@pytest.mark.write_disk()
 def test_dataset(df: pl.DataFrame) -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         file_path = Path(temp_dir) / "small.ipc"
@@ -75,5 +75,26 @@ def test_dataset(df: pl.DataFrame) -> None:
             file_path,
             lambda lf: lf.filter(pl.col("floats").sum().over("date") == 10)
             .select(["bools", "floats", "date"])
+            .collect(),
+        )
+
+        # temporal types
+        helper_dataset_test(
+            file_path,
+            lambda lf: lf.filter(pl.col("date") < date(1972, 1, 1))
+            .select(["bools", "floats", "date"])
+            .collect(),
+        )
+        helper_dataset_test(
+            file_path,
+            lambda lf: lf.filter(pl.col("datetime") > datetime(1970, 1, 1, second=13))
+            .select(["bools", "floats", "date"])
+            .collect(),
+        )
+        # not yet supported in pyarrow
+        helper_dataset_test(
+            file_path,
+            lambda lf: lf.filter(pl.col("time") >= time(microsecond=100))
+            .select(["bools", "time", "date"])
             .collect(),
         )

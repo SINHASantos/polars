@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 import polars as pl
-from polars.exceptions import ComputeError
+from polars.exceptions import ArrowError, ComputeError
 from polars.testing import assert_series_equal
 
 if sys.version_info >= (3, 9):
@@ -23,8 +23,7 @@ else:
     from backports.zoneinfo._zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
-    from polars.datatypes import PolarsTemporalType
-    from polars.internals.type_aliases import TimeUnit
+    from polars.type_aliases import PolarsTemporalType, TimeUnit
 
 
 def test_str_strptime() -> None:
@@ -59,7 +58,7 @@ def test_strptime_precision() -> None:
     )
     ds = s.str.strptime(pl.Datetime)
     assert ds.cast(pl.Date) != None  # noqa: E711  (note: *deliberately* testing "!=")
-    assert getattr(ds.dtype, "tu", None) == "us"
+    assert getattr(ds.dtype, "time_unit", None) == "us"
 
     time_units: list[TimeUnit] = ["ms", "us", "ns"]
     suffixes = ["%.3f", "%.6f", "%.9f"]
@@ -74,7 +73,7 @@ def test_strptime_precision() -> None:
     )
     for precision, suffix, expected_values in test_data:
         ds = s.str.strptime(pl.Datetime(precision), f"%Y-%m-%d %H:%M:%S{suffix}")
-        assert getattr(ds.dtype, "tu", None) == precision
+        assert getattr(ds.dtype, "time_unit", None) == precision
         assert ds.dt.nanosecond().to_list() == expected_values
 
 
@@ -93,14 +92,13 @@ def test_strptime_precision_with_time_unit(
 
 @pytest.mark.parametrize("fmt", ["%Y-%m-%dT%H:%M:%S", None])
 def test_utc_with_tz_naive(fmt: str | None) -> None:
-    with pytest.raises(
-        ComputeError,
-        match=(
-            r"^Cannot use 'utc=True' with tz-naive data. "
-            r"Parse the data as naive, and then use `.dt.convert_time_zone\('UTC'\)`.$"
-        ),
-    ):
-        pl.Series(["2020-01-01 00:00:00"]).str.strptime(pl.Datetime, fmt, utc=True)
+    result = (
+        pl.Series(["2020-01-01T00:00:00"])
+        .str.strptime(pl.Datetime, fmt, utc=True)
+        .item()
+    )
+    expected = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    assert result == expected
 
 
 @pytest.mark.parametrize(
@@ -166,11 +164,74 @@ def test_strptime_dates_datetimes() -> None:
         ("2018-09-05T14:24:02.123", datetime(2018, 9, 5, 14, 24, 2, 123000)),
         ("2019-04-18T02:45:55.555000000", datetime(2019, 4, 18, 2, 45, 55, 555000)),
         ("2019-04-18T22:45:55.555123", datetime(2019, 4, 18, 22, 45, 55, 555123)),
+        (
+            "2018-09-05T04:05:01+01:00",
+            datetime(2018, 9, 5, 4, 5, 1, tzinfo=timezone(timedelta(hours=1))),
+        ),
+        (
+            "2018-09-05T04:24:01.9+01:00",
+            datetime(2018, 9, 5, 4, 24, 1, 900000, tzinfo=timezone(timedelta(hours=1))),
+        ),
+        (
+            "2018-09-05T04:24:02.11+01:00",
+            datetime(2018, 9, 5, 4, 24, 2, 110000, tzinfo=timezone(timedelta(hours=1))),
+        ),
+        (
+            "2018-09-05T14:24:02.123+01:00",
+            datetime(
+                2018, 9, 5, 14, 24, 2, 123000, tzinfo=timezone(timedelta(hours=1))
+            ),
+        ),
+        (
+            "2019-04-18T02:45:55.555000000+01:00",
+            datetime(
+                2019, 4, 18, 2, 45, 55, 555000, tzinfo=timezone(timedelta(hours=1))
+            ),
+        ),
+        (
+            "2019-04-18T22:45:55.555123+01:00",
+            datetime(
+                2019, 4, 18, 22, 45, 55, 555123, tzinfo=timezone(timedelta(hours=1))
+            ),
+        ),
     ],
 )
 def test_datetime_strptime_patterns_single(time_string: str, expected: str) -> None:
     result = pl.Series([time_string]).str.strptime(pl.Datetime).item()
     assert result == expected
+
+
+@pytest.mark.parametrize("time_unit", ["ms", "us", "ns"])
+def test_infer_tz_aware_time_unit(time_unit: TimeUnit) -> None:
+    result = pl.Series(["2020-01-02T04:00:00+02:00"]).str.strptime(
+        pl.Datetime(time_unit)
+    )
+    assert result.dtype == pl.Datetime(time_unit, "+02:00")
+    assert result.item() == datetime(
+        2020, 1, 2, 4, 0, tzinfo=timezone(timedelta(hours=2))
+    )
+
+
+@pytest.mark.parametrize("time_unit", ["ms", "us", "ns"])
+def test_infer_tz_aware_with_utc(time_unit: TimeUnit) -> None:
+    result = pl.Series(["2020-01-02T04:00:00+02:00"]).str.strptime(
+        pl.Datetime(time_unit), utc=True
+    )
+    assert result.dtype == pl.Datetime(time_unit, "UTC")
+    assert result.item() == datetime(2020, 1, 2, 2, 0, tzinfo=timezone.utc)
+
+
+def test_infer_tz_aware_raises() -> None:
+    msg = "cannot parse tz-aware values with tz-aware dtype - please drop the time zone from the dtype"
+    with pytest.raises(ComputeError, match=msg):
+        pl.Series(["2020-01-02T04:00:00+02:00"]).str.strptime(
+            pl.Datetime("us", "Europe/Vienna")
+        )
+    msg = "cannot use strptime with both 'utc=True' and tz-aware dtype, please drop time zone from the dtype"
+    with pytest.raises(ComputeError, match=msg):
+        pl.Series(["2020-01-02T04:00:00+02:00"]).str.strptime(
+            pl.Datetime("us", "Europe/Vienna"), utc=True
+        )
 
 
 def test_datetime_strptime_patterns_consistent() -> None:
@@ -293,6 +354,25 @@ def test_abbrev_month(
     assert result == expected
 
 
+def test_full_month_name() -> None:
+    s = pl.Series(["2022-December-01"]).str.strptime(pl.Datetime, "%Y-%B-%d")
+    assert s[0] == datetime(2022, 12, 1)
+
+
+@pytest.mark.parametrize(
+    ("datatype", "expected"),
+    [
+        (pl.Datetime, datetime(2022, 1, 1)),
+        (pl.Date, date(2022, 1, 1)),
+    ],
+)
+def test_single_digit_month(
+    datatype: PolarsTemporalType, expected: datetime | date
+) -> None:
+    s = pl.Series(["2022-1-1"]).str.strptime(datatype, "%Y-%m-%d")
+    assert s[0] == expected
+
+
 def test_invalid_date_parsing_4898() -> None:
     assert pl.Series(["2022-09-18", "2022-09-50"]).str.strptime(
         pl.Date, "%Y-%m-%d", strict=False
@@ -303,8 +383,21 @@ def test_replace_timezone_invalid_timezone() -> None:
     ts = pl.Series(["2020-01-01 00:00:00+01:00"]).str.strptime(
         pl.Datetime, "%Y-%m-%d %H:%M:%S%z"
     )
-    with pytest.raises(ComputeError, match=r"Could not parse time zone foo"):
+    with pytest.raises(ComputeError, match=r"unable to parse time zone: 'foo'"):
         ts.dt.replace_time_zone("foo")
+
+
+def test_replace_time_zone_ambiguous_or_non_existent() -> None:
+    with pytest.raises(
+        ArrowError,
+        match="datetime '2021-11-07 01:00:00' is ambiguous in time zone 'US/Central'",
+    ):
+        pl.Series(["2021-11-07 01:00"]).str.strptime(pl.Datetime("us", "US/Central"))
+    with pytest.raises(
+        ArrowError,
+        match="datetime '2021-03-28 02:30:00' is non-existent in time zone 'Europe/Warsaw'",
+    ):
+        pl.Series(["2021-03-28 02:30"]).str.strptime(pl.Datetime("us", "Europe/Warsaw"))
 
 
 @pytest.mark.parametrize(
@@ -345,11 +438,7 @@ def test_crossing_dst(fmt: str) -> None:
 def test_crossing_dst_tz_aware(fmt: str) -> None:
     ts = ["2021-03-27T23:59:59+01:00", "2021-03-28T23:59:59+02:00"]
     with pytest.raises(
-        ComputeError,
-        match=(
-            r"^Different timezones found during 'strptime' operation. "
-            "You might want to use `utc=True` and then set the time zone after parsing$"
-        ),
+        ComputeError, match="^different timezones found during 'strptime' operation"
     ):
         pl.Series(ts).str.strptime(pl.Datetime, fmt, utc=False)
 
@@ -358,8 +447,12 @@ def test_tz_aware_without_fmt() -> None:
     with pytest.raises(
         ComputeError,
         match=(
-            r"^Passing 'tz_aware=True' without 'fmt' is not yet supported. "
-            r"Please specify 'fmt'.$"
+            r"^passing 'tz_aware=True' without 'fmt' is not yet supported, "
+            r"please specify 'fmt'$"
         ),
+    ), pytest.warns(
+        DeprecationWarning,
+        match="`tz_aware` is now auto-inferred from `fmt` and will be removed "
+        "in a future version. You can safely drop this argument.",
     ):
         pl.Series(["2020-01-01"]).str.strptime(pl.Datetime, tz_aware=True)

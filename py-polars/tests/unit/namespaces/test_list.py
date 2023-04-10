@@ -317,7 +317,7 @@ def test_list_take() -> None:
     # use another list to make sure negative indices are respected
     taker = pl.Series([[-1, 1], [-1, 1], [-1, -2]])
     assert s.arr.take(taker).to_list() == [[3, 2], [5, 5], [8, 7]]
-    with pytest.raises(pl.ComputeError, match=r"Take indices are out of bounds"):
+    with pytest.raises(pl.ComputeError, match=r"take indices are out of bounds"):
         s.arr.take([1, 2])
     s = pl.Series(
         [["A", "B", "C"], ["A"], ["B"], ["1", "2"], ["e"]],
@@ -339,7 +339,7 @@ def test_list_take() -> None:
     ]
     s = pl.Series([[42, 1, 2], [5, 6, 7]])
 
-    with pytest.raises(pl.ComputeError, match=r"Take indices are out of bounds"):
+    with pytest.raises(pl.ComputeError, match=r"take indices are out of bounds"):
         s.arr.take([[0, 1, 2, 3], [0, 1, 2, 3]])
 
     assert s.arr.take([0, 1, 2, 3], null_on_oob=True).to_list() == [
@@ -374,9 +374,9 @@ def test_list_function_group_awareness() -> None:
         ]
     ).sort("group").to_dict(False) == {
         "group": [0, 1, 2],
-        "get": [[100], [105], [100]],
-        "take": [[[100]], [[105]], [[100]]],
-        "slice": [[[100, 103]], [[105, 106, 105]], [[100, 102]]],
+        "get": [100, 105, 100],
+        "take": [[100], [105], [100]],
+        "slice": [[100, 103], [105, 106, 105], [100, 102]],
     }
 
 
@@ -392,3 +392,24 @@ def test_list_get_logical_types() -> None:
         "date_col_element_1": [date(2023, 2, 2)],
         "datetime_col_element_1": [datetime(2023, 2, 2, 0, 0)],
     }
+
+
+def test_list_take_logical_type() -> None:
+    df = pl.DataFrame(
+        {"foo": [["foo", "foo", "bar"]], "bar": [[5.0, 10.0, 12.0]]}
+    ).with_columns(pl.col("foo").cast(pl.List(pl.Categorical)))
+
+    df = pl.concat([df, df], rechunk=False)
+    assert df.n_chunks() == 2
+    assert df.select(pl.all().take([0, 1])).to_dict(False) == {
+        "foo": [["foo", "foo", "bar"], ["foo", "foo", "bar"]],
+        "bar": [[5.0, 10.0, 12.0], [5.0, 10.0, 12.0]],
+    }
+
+
+def test_list_unique() -> None:
+    assert (
+        pl.Series([[1, 1, 2, 2, 3], [3, 3, 3, 2, 1, 2]])
+        .arr.unique(maintain_order=True)
+        .series_equal(pl.Series([[1, 2, 3], [3, 2, 1]]))
+    )

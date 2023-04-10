@@ -28,7 +28,6 @@ where
     unsafe { BooleanChunked::from_chunks(ca.name(), chunks) }
 }
 
-#[cfg(feature = "dtype-binary")]
 fn is_first_bin(ca: &BinaryChunked) -> BooleanChunked {
     let mut unique = PlHashSet::new();
     let chunks = ca
@@ -85,12 +84,10 @@ pub fn is_first(s: &Series) -> PolarsResult<BooleanChunked> {
             let ca = s.bool().unwrap();
             is_first_boolean(ca)
         }
-        #[cfg(feature = "dtype-binary")]
         Binary => {
             let ca = s.binary().unwrap();
             is_first_bin(ca)
         }
-        #[cfg(feature = "dtype-binary")]
         Utf8 => {
             let s = s.cast(&Binary).unwrap();
             return is_first(&s);
@@ -111,11 +108,7 @@ pub fn is_first(s: &Series) -> PolarsResult<BooleanChunked> {
         }
         #[cfg(feature = "dtype-struct")]
         Struct(_) => return is_first_struct(&s),
-        dt => {
-            return Err(PolarsError::ComputeError(
-                format!("Dtype {dt} not supported in 'is_first' operation.").into(),
-            ))
-        }
+        dt => polars_bail!(opq = is_first, dt),
     };
     Ok(out)
 }

@@ -26,9 +26,7 @@ fn validate_time_zone(tz: TimeZone) -> PolarsResult<()> {
         Ok(_) => Ok(()),
         Err(_) => match tz.parse::<Tz>() {
             Ok(_) => Ok(()),
-            Err(_) => Err(PolarsError::ComputeError(
-                format!("Could not parse timezone: '{tz}'").into(),
-            )),
+            Err(_) => polars_bail!(ComputeError: "unable to parse time zone: '{}'", tz),
         },
     }
 }
@@ -120,41 +118,13 @@ impl DatetimeChunked {
         }
     }
 
-    pub fn apply_on_tz_corrected<F>(&self, mut func: F) -> PolarsResult<DatetimeChunked>
-    where
-        F: FnMut(DatetimeChunked) -> PolarsResult<DatetimeChunked>,
-    {
-        #[allow(unused_mut)]
-        let mut ca = self.clone();
-        #[cfg(feature = "timezones")]
-        if self.time_zone().is_some() {
-            ca = self.replace_time_zone(Some("UTC"))?
-        }
-        let out = func(ca)?;
-
-        #[cfg(feature = "timezones")]
-        if let Some(tz) = self.time_zone() {
-            return out
-                .convert_time_zone("UTC".to_string())?
-                .replace_time_zone(Some(tz));
-        }
-        Ok(out)
-    }
-
     #[cfg(feature = "timezones")]
     pub fn replace_time_zone(&self, time_zone: Option<&str>) -> PolarsResult<DatetimeChunked> {
         match (self.time_zone(), time_zone) {
             (Some(from), Some(to)) => {
                 let chunks = self
                     .downcast_iter()
-                    .map(|arr| {
-                        replace_timezone(
-                            arr,
-                            self.time_unit().to_arrow(),
-                            to.to_string(),
-                            from.to_string(),
-                        )
-                    })
+                    .map(|arr| replace_timezone(arr, self.time_unit().to_arrow(), to, from))
                     .collect::<PolarsResult<_>>()?;
                 let out = unsafe { ChunkedArray::from_chunks(self.name(), chunks) };
                 Ok(out.into_datetime(self.time_unit(), Some(to.to_string())))
@@ -162,14 +132,7 @@ impl DatetimeChunked {
             (Some(from), None) => {
                 let chunks = self
                     .downcast_iter()
-                    .map(|arr| {
-                        replace_timezone(
-                            arr,
-                            self.time_unit().to_arrow(),
-                            "UTC".to_string(),
-                            from.to_string(),
-                        )
-                    })
+                    .map(|arr| replace_timezone(arr, self.time_unit().to_arrow(), "UTC", from))
                     .collect::<PolarsResult<_>>()?;
                 let out = unsafe { ChunkedArray::from_chunks(self.name(), chunks) };
                 Ok(out.into_datetime(self.time_unit(), None))
@@ -177,14 +140,7 @@ impl DatetimeChunked {
             (None, Some(to)) => {
                 let chunks = self
                     .downcast_iter()
-                    .map(|arr| {
-                        replace_timezone(
-                            arr,
-                            self.time_unit().to_arrow(),
-                            to.to_string(),
-                            "UTC".to_string(),
-                        )
-                    })
+                    .map(|arr| replace_timezone(arr, self.time_unit().to_arrow(), to, "UTC"))
                     .collect::<PolarsResult<_>>()?;
                 let out = unsafe { ChunkedArray::from_chunks(self.name(), chunks) };
                 Ok(out.into_datetime(self.time_unit(), Some(to.to_string())))
@@ -215,16 +171,12 @@ impl DatetimeChunked {
                 "{}",
                 Utc.from_local_datetime(&dt).earliest().unwrap().format(fmt)
             )
-            .map_err(|_| {
-                PolarsError::ComputeError(
-                    format!("Cannot format DateTime with format '{fmt}'.").into(),
-                )
-            })?,
-            _ => write!(fmted, "{}", dt.format(fmt)).map_err(|_| {
-                PolarsError::ComputeError(
-                    format!("Cannot format NaiveDateTime with format '{fmt}'.").into(),
-                )
-            })?,
+            .map_err(
+                |_| polars_err!(ComputeError: "cannot format DateTime with format '{}'", fmt),
+            )?,
+            _ => write!(fmted, "{}", dt.format(fmt)).map_err(
+                |_| polars_err!(ComputeError: "cannot format NaiveDateTime with format '{}'", fmt),
+            )?,
         };
         let fmted = fmted; // discard mut
 
@@ -335,16 +287,14 @@ impl DatetimeChunked {
     }
     #[cfg(feature = "timezones")]
     pub fn convert_time_zone(mut self, time_zone: TimeZone) -> PolarsResult<Self> {
-        match self.time_zone() {
-            Some(_) => {
-                self.set_time_zone(time_zone)?;
-                Ok(self)
-            }
-            _ => Err(PolarsError::ComputeError(
-                "Cannot call convert_time_zone on tz-naive. Set a time zone first with replace_time_zone"
-                    .into(),
-            )),
-        }
+        polars_ensure!(
+            self.time_zone().is_some(),
+            InvalidOperation:
+            "cannot call `convert_time_zone` on tz-naive; \
+            set a time zone first with `replace_time_zone`"
+        );
+        self.set_time_zone(time_zone)?;
+        Ok(self)
     }
 }
 
@@ -373,9 +323,9 @@ mod test {
         );
         assert_eq!(
             [
-                588470416000_000_000,
-                1441497364000_000_000,
-                1356048000000_000_000
+                588_470_416_000_000_000,
+                1_441_497_364_000_000_000,
+                1_356_048_000_000_000_000
             ],
             dt.cont_slice().unwrap()
         );

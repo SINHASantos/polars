@@ -1,6 +1,5 @@
 #[cfg(feature = "arg_where")]
 mod arg_where;
-#[cfg(feature = "dtype-binary")]
 mod binary;
 #[cfg(feature = "round_series")]
 mod clip;
@@ -40,7 +39,6 @@ use polars_core::prelude::*;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "dtype-binary")]
 pub(crate) use self::binary::BinaryFunction;
 #[cfg(feature = "temporal")]
 pub(super) use self::datetime::TemporalFunction;
@@ -68,7 +66,6 @@ pub enum FunctionExpr {
     SearchSorted(SearchSortedSide),
     #[cfg(feature = "strings")]
     StringExpr(StringFunction),
-    #[cfg(feature = "dtype-binary")]
     BinaryExpr(BinaryFunction),
     #[cfg(feature = "temporal")]
     TemporalExpr(TemporalFunction),
@@ -145,7 +142,6 @@ impl Display for FunctionExpr {
             SearchSorted(_) => "search_sorted",
             #[cfg(feature = "strings")]
             StringExpr(s) => return write!(f, "{s}"),
-            #[cfg(feature = "dtype-binary")]
             BinaryExpr(b) => return write!(f, "{b}"),
             #[cfg(feature = "temporal")]
             TemporalExpr(fun) => return write!(f, "{fun}"),
@@ -229,7 +225,7 @@ macro_rules! map_as_slice {
 
 // FnOnce(Series)
 // FnOnce(Series, args)
-#[macro_export(super)]
+#[macro_export]
 macro_rules! map_owned {
     ($func:path) => {{
         let f = move |s: &mut [Series]| {
@@ -251,7 +247,7 @@ macro_rules! map_owned {
 }
 
 // Fn(&Series, args)
-#[macro_export(super)]
+#[macro_export]
 macro_rules! map {
     ($func:path) => {{
         let f = move |s: &mut [Series]| {
@@ -304,7 +300,6 @@ impl From<FunctionExpr> for SpecialEq<Arc<dyn SeriesUdf>> {
             }
             #[cfg(feature = "strings")]
             StringExpr(s) => s.into(),
-            #[cfg(feature = "dtype-binary")]
             BinaryExpr(s) => s.into(),
             #[cfg(feature = "temporal")]
             TemporalExpr(func) => func.into(),
@@ -430,19 +425,18 @@ impl From<StringFunction> for SpecialEq<Arc<dyn SeriesUdf>> {
             #[cfg(feature = "concat_str")]
             ConcatHorizontal(delimiter) => map_as_slice!(strings::concat_hor, &delimiter),
             #[cfg(feature = "regex")]
-            Replace { all, literal } => map_as_slice!(strings::replace, literal, all),
+            Replace { n, literal } => map_as_slice!(strings::replace, literal, n),
             Uppercase => map!(strings::uppercase),
             Lowercase => map!(strings::lowercase),
             Strip(matches) => map!(strings::strip, matches.as_deref()),
             LStrip(matches) => map!(strings::lstrip, matches.as_deref()),
             RStrip(matches) => map!(strings::rstrip, matches.as_deref()),
             #[cfg(feature = "string_from_radix")]
-            FromRadix(matches) => map!(strings::from_radix, matches),
+            FromRadix(radix, strict) => map!(strings::from_radix, radix, strict),
         }
     }
 }
 
-#[cfg(feature = "dtype-binary")]
 impl From<BinaryFunction> for SpecialEq<Arc<dyn SeriesUdf>> {
     fn from(func: BinaryFunction) -> Self {
         use BinaryFunction::*;
@@ -467,6 +461,7 @@ impl From<TemporalFunction> for SpecialEq<Arc<dyn SeriesUdf>> {
         use TemporalFunction::*;
         match func {
             Year => map!(datetime::year),
+            IsLeapYear => map!(datetime::is_leap_year),
             IsoYear => map!(datetime::iso_year),
             Month => map!(datetime::month),
             Quarter => map!(datetime::quarter),
@@ -474,6 +469,9 @@ impl From<TemporalFunction> for SpecialEq<Arc<dyn SeriesUdf>> {
             WeekDay => map!(datetime::weekday),
             Day => map!(datetime::day),
             OrdinalDay => map!(datetime::ordinal_day),
+            Time => map!(datetime::time),
+            Date => map!(datetime::date),
+            Datetime => map!(datetime::datetime),
             Hour => map!(datetime::hour),
             Minute => map!(datetime::minute),
             Second => map!(datetime::second),

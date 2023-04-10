@@ -55,15 +55,11 @@ pub(crate) fn is_unique_helper(
 #[cfg(feature = "object")]
 impl<T: PolarsObject> ChunkUnique<ObjectType<T>> for ObjectChunked<T> {
     fn unique(&self) -> PolarsResult<ChunkedArray<ObjectType<T>>> {
-        Err(PolarsError::InvalidOperation(
-            "unique not supported for object".into(),
-        ))
+        polars_bail!(opq = unique, self.dtype());
     }
 
     fn arg_unique(&self) -> PolarsResult<IdxCa> {
-        Err(PolarsError::InvalidOperation(
-            "unique not supported for object".into(),
-        ))
+        polars_bail!(opq = arg_unique, self.dtype());
     }
 }
 
@@ -205,51 +201,25 @@ where
 
 impl ChunkUnique<Utf8Type> for Utf8Chunked {
     fn unique(&self) -> PolarsResult<Self> {
-        match self.null_count() {
-            0 => {
-                let mut set =
-                    PlHashSet::with_capacity(std::cmp::min(HASHMAP_INIT_SIZE, self.len()));
-                for arr in self.downcast_iter() {
-                    set.extend(arr.values_iter())
-                }
-                Ok(Utf8Chunked::from_iter_values(
-                    self.name(),
-                    set.iter().copied(),
-                ))
-            }
-            _ => {
-                let mut set =
-                    PlHashSet::with_capacity(std::cmp::min(HASHMAP_INIT_SIZE, self.len()));
-                for arr in self.downcast_iter() {
-                    set.extend(arr.iter())
-                }
-                Ok(Utf8Chunked::from_iter_options(
-                    self.name(),
-                    set.iter().copied(),
-                ))
-            }
-        }
+        let out = self.as_binary().unique()?;
+        Ok(unsafe { out.to_utf8() })
     }
 
     fn arg_unique(&self) -> PolarsResult<IdxCa> {
-        Ok(IdxCa::from_vec(self.name(), arg_unique_ca!(self)))
+        self.as_binary().arg_unique()
     }
 
     fn n_unique(&self) -> PolarsResult<usize> {
-        if self.null_count() > 0 {
-            Ok(fill_set(self.into_iter().flatten()).len() + 1)
-        } else {
-            Ok(fill_set(self.into_no_null_iter()).len())
-        }
+        self.as_binary().n_unique()
     }
 
     #[cfg(feature = "mode")]
     fn mode(&self) -> PolarsResult<Self> {
-        Ok(mode(self))
+        let out = self.as_binary().mode()?;
+        Ok(unsafe { out.to_utf8() })
     }
 }
 
-#[cfg(feature = "dtype-binary")]
 impl ChunkUnique<BinaryType> for BinaryChunked {
     fn unique(&self) -> PolarsResult<Self> {
         match self.null_count() {
@@ -326,6 +296,12 @@ impl ChunkUnique<Float32Type> for Float32Chunked {
     fn arg_unique(&self) -> PolarsResult<IdxCa> {
         self.bit_repr_small().arg_unique()
     }
+    #[cfg(feature = "mode")]
+    fn mode(&self) -> PolarsResult<ChunkedArray<Float32Type>> {
+        let s = self.apply_as_ints(|v| v.mode().unwrap());
+        let ca = s.f32().unwrap().clone();
+        Ok(ca)
+    }
 }
 
 impl ChunkUnique<Float64Type> for Float64Chunked {
@@ -337,6 +313,12 @@ impl ChunkUnique<Float64Type> for Float64Chunked {
 
     fn arg_unique(&self) -> PolarsResult<IdxCa> {
         self.bit_repr_large().arg_unique()
+    }
+    #[cfg(feature = "mode")]
+    fn mode(&self) -> PolarsResult<ChunkedArray<Float64Type>> {
+        let s = self.apply_as_ints(|v| v.mode().unwrap());
+        let ca = s.f64().unwrap().clone();
+        Ok(ca)
     }
 }
 
@@ -382,12 +364,12 @@ mod test {
     fn mode() {
         let ca = Int32Chunked::from_slice("a", &[0, 1, 2, 3, 4, 4, 5, 6, 5, 0]);
         let mut result = Vec::from(&ca.mode().unwrap());
-        result.sort_by(|a, b| a.unwrap().cmp(&b.unwrap()));
+        result.sort_by_key(|a| a.unwrap());
         assert_eq!(&result, &[Some(0), Some(4), Some(5)]);
 
         let ca2 = Int32Chunked::from_slice("b", &[1, 1]);
         let mut result2 = Vec::from(&ca2.mode().unwrap());
-        result2.sort_by(|a, b| a.unwrap().cmp(&b.unwrap()));
+        result2.sort_by_key(|a| a.unwrap());
         assert_eq!(&result2, &[Some(1)]);
 
         let ca3 = Int32Chunked::from_slice("c", &[]);

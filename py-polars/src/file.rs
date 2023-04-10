@@ -191,7 +191,7 @@ pub enum EitherRustPythonFile {
 
 fn no_such_file_err(file_path: &str) -> PyResult<()> {
     let msg = if file_path.len() > 88 {
-        let file_path: String = file_path.chars().rev().take(88).collect();
+        let file_path: String = file_path.chars().skip(file_path.len() - 88).collect();
         format!("No such file or directory: ...{file_path}",)
     } else {
         format!("No such file or directory: {file_path}",)
@@ -259,7 +259,7 @@ pub fn get_mmap_bytes_reader<'a>(py_f: &'a PyAny) -> PyResult<Box<dyn MmapBytesR
     else if py_f.getattr("read").is_ok() {
         // we can still get a file name, inform the user of possibly wrong API usage.
         if py_f.getattr("name").is_ok() {
-            eprint!("Polars found a filename. \
+            eprintln!("Polars found a filename. \
             Ensure you pass a path to the file instead of a python file object when possible for best \
             performance.")
         }

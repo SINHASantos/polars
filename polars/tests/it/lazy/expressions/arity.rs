@@ -279,6 +279,7 @@ fn test_binary_over_3930() -> PolarsResult<()> {
 }
 
 #[test]
+#[cfg(feature = "rank")]
 fn test_ternary_aggregation_set_literals() -> PolarsResult<()> {
     let df = df![
         "name" => ["a", "b", "a", "b"],
@@ -290,7 +291,7 @@ fn test_ternary_aggregation_set_literals() -> PolarsResult<()> {
         .lazy()
         .groupby([col("name")])
         .agg([when(col("value").sum().eq(lit(3)))
-            .then(col("value").rank(Default::default()))
+            .then(col("value").rank(Default::default(), None))
             .otherwise(lit(Series::new("", &[10 as IdxSize])))])
         .sort("name", Default::default())
         .collect()?;
@@ -311,7 +312,7 @@ fn test_ternary_aggregation_set_literals() -> PolarsResult<()> {
         .groupby([col("name")])
         .agg([when(col("value").sum().eq(lit(3)))
             .then(lit(Series::new("", &[10 as IdxSize])).alias("value"))
-            .otherwise(col("value").rank(Default::default()))])
+            .otherwise(col("value").rank(Default::default(), None))])
         .sort("name", Default::default())
         .collect()?;
 
@@ -330,7 +331,7 @@ fn test_ternary_aggregation_set_literals() -> PolarsResult<()> {
         .lazy()
         .groupby([col("name")])
         .agg([when(col("value").sum().eq(lit(3)))
-            .then(col("value").rank(Default::default()))
+            .then(col("value").rank(Default::default(), None))
             .otherwise(Null {}.lit())])
         .sort("name", Default::default())
         .collect()?;
@@ -345,7 +346,7 @@ fn test_ternary_aggregation_set_literals() -> PolarsResult<()> {
         .groupby([col("name")])
         .agg([when(col("value").sum().eq(lit(3)))
             .then(Null {}.lit().alias("value"))
-            .otherwise(col("value").rank(Default::default()))])
+            .otherwise(col("value").rank(Default::default(), None))])
         .sort("name", Default::default())
         .collect()?;
 

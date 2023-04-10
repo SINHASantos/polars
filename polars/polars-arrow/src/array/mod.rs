@@ -11,6 +11,7 @@ pub mod default_arrays;
 mod get;
 pub mod list;
 pub mod slice;
+pub mod utf8;
 
 pub use get::ArrowGetItem;
 pub use slice::*;
@@ -50,6 +51,11 @@ impl ValueSize for ArrayRef {
             DataType::LargeList(_) => self
                 .as_any()
                 .downcast_ref::<ListArray<i64>>()
+                .unwrap()
+                .get_values_size(),
+            DataType::LargeBinary => self
+                .as_any()
+                .downcast_ref::<BinaryArray<i64>>()
                 .unwrap()
                 .get_values_size(),
             _ => unimplemented!(),

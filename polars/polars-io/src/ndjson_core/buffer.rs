@@ -1,7 +1,7 @@
 use std::hash::{Hash, Hasher};
 
 use arrow::types::NativeType;
-use num::traits::NumCast;
+use num_traits::NumCast;
 use polars_core::frame::row::AnyValueBuffer;
 use polars_core::prelude::*;
 #[cfg(any(feature = "dtype-datetime", feature = "dtype-date"))]
@@ -128,7 +128,7 @@ pub(crate) fn init_buffers(
         .iter()
         .map(|(name, dtype)| {
             let av_buf = (dtype, capacity).into();
-            let key = KnownKey::from(name);
+            let key = KnownKey::from(name.as_str());
             Ok((BufferKey(key), Buffer(name, av_buf)))
         })
         .collect()
@@ -136,10 +136,10 @@ pub(crate) fn init_buffers(
 
 fn deserialize_number<T: NativeType + NumCast>(value: &Value) -> Option<T> {
     match value {
-        Value::Static(StaticNode::F64(f)) => num::traits::cast::<f64, T>(*f),
-        Value::Static(StaticNode::I64(i)) => num::traits::cast::<i64, T>(*i),
-        Value::Static(StaticNode::U64(u)) => num::traits::cast::<u64, T>(*u),
-        Value::Static(StaticNode::Bool(b)) => num::traits::cast::<i32, T>(*b as i32),
+        Value::Static(StaticNode::F64(f)) => num_traits::cast(*f),
+        Value::Static(StaticNode::I64(i)) => num_traits::cast(*i),
+        Value::Static(StaticNode::U64(u)) => num_traits::cast(*u),
+        Value::Static(StaticNode::Bool(b)) => num_traits::cast(*b as i32),
         _ => None,
     }
 }
@@ -154,9 +154,9 @@ where
         Value::String(s) => s,
         _ => return None,
     };
-    infer_pattern_single(val).and_then(|pattern| {
-        match DatetimeInfer::<T::Native>::try_from(pattern) {
-            Ok(mut infer) => infer.parse(val),
+    infer_pattern_single(val).and_then(|pattern_with_offset| {
+        match DatetimeInfer::<T::Native>::try_from(pattern_with_offset.pattern) {
+            Ok(mut infer) => infer.parse(val, pattern_with_offset.offset),
             Err(_) => None,
         }
     })
@@ -171,16 +171,14 @@ fn deserialize_all<'a>(json: &Value, dtype: &DataType) -> PolarsResult<AnyValue<
         Value::Static(StaticNode::Null) => AnyValue::Null,
         Value::String(s) => AnyValue::Utf8Owned(s.as_ref().into()),
         Value::Array(arr) => {
-            let inner_dtype = dtype.inner_dtype().ok_or_else(|| {
-                PolarsError::ComputeError(
-                    format!("Expected List/Array in json value got: {dtype}").into(),
-                )
-            })?;
+            let Some(inner_dtype) = dtype.inner_dtype() else {
+                polars_bail!(ComputeError: "expected list/array in json value, got {}", dtype);
+            };
             let vals: Vec<AnyValue> = arr
                 .iter()
                 .map(|val| deserialize_all(val, inner_dtype))
                 .collect::<PolarsResult<_>>()?;
-            let s = Series::from_any_values_and_dtype("", &vals, inner_dtype)?;
+            let s = Series::from_any_values_and_dtype("", &vals, inner_dtype, false)?;
             AnyValue::List(s)
         }
         #[cfg(feature = "dtype-struct")]
@@ -200,9 +198,9 @@ fn deserialize_all<'a>(json: &Value, dtype: &DataType) -> PolarsResult<AnyValue<
                     .collect::<PolarsResult<Vec<_>>>()?;
                 AnyValue::StructOwned(Box::new((vals, fields.clone())))
             } else {
-                return Err(PolarsError::ComputeError(
-                    format!("Expected: {dtype} but got object instead.").into(),
-                ));
+                polars_bail!(
+                    ComputeError: "expected {dtype} in json value, got object",
+                );
             }
         }
         #[cfg(not(feature = "dtype-struct"))]

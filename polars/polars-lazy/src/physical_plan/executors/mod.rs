@@ -1,7 +1,5 @@
 mod cache;
-mod drop_duplicates;
 mod executor;
-mod explode;
 mod ext_context;
 mod filter;
 mod groupby;
@@ -9,7 +7,6 @@ mod groupby_dynamic;
 mod groupby_partitioned;
 mod groupby_rolling;
 mod join;
-mod melt;
 mod projection;
 #[cfg(feature = "python")]
 mod python_scan;
@@ -19,9 +16,9 @@ mod sort;
 mod stack;
 mod udf;
 mod union;
+mod unique;
 
 use std::borrow::Cow;
-use std::path::PathBuf;
 
 pub use executor::*;
 use polars_core::POOL;
@@ -30,8 +27,6 @@ use polars_plan::utils::*;
 use rayon::prelude::*;
 
 pub(super) use self::cache::*;
-pub(super) use self::drop_duplicates::*;
-pub(super) use self::explode::*;
 pub(super) use self::ext_context::*;
 pub(super) use self::filter::*;
 pub(super) use self::groupby::*;
@@ -41,7 +36,6 @@ pub(super) use self::groupby_partitioned::*;
 #[cfg(feature = "dynamic_groupby")]
 pub(super) use self::groupby_rolling::*;
 pub(super) use self::join::*;
-pub(super) use self::melt::*;
 pub(super) use self::projection::*;
 #[cfg(feature = "python")]
 pub(super) use self::python_scan::*;
@@ -51,6 +45,7 @@ pub(super) use self::sort::*;
 pub(super) use self::stack::*;
 pub(super) use self::udf::*;
 pub(super) use self::union::*;
+pub(super) use self::unique::*;
 use super::*;
 
 fn execute_projection_cached_window_fns(
@@ -69,7 +64,7 @@ fn execute_projection_cached_window_fns(
     // String: partition_name,
     // u32: index,
     // bool: flatten (we must run those first because they need a sorted group tuples.
-    //       if we cache the group tuples we must ensure we cast the sorted onces.
+    //       if we cache the group tuples we must ensure we cast the sorted ones.
     let mut windows: Vec<(String, Vec<(u32, bool, Arc<dyn PhysicalExpr>)>)> = vec![];
     let mut other = Vec::with_capacity(exprs.len());
 
@@ -190,11 +185,7 @@ fn check_expand_literals(
                 all_equal_len = false;
             }
             let name = s.name();
-            if !names.insert(name) {
-                return Err(PolarsError::Duplicate(
-                    format!("Column with name: '{name}' has more than one occurrences").into(),
-                ));
-            }
+            polars_ensure!(names.insert(name), duplicate = name);
         }
     }
     // If all series are the same length it is ok. If not we can broadcast Series of length one.
@@ -202,18 +193,16 @@ fn check_expand_literals(
         selected_columns = selected_columns
             .into_iter()
             .map(|series| {
-                if series.len() == 1 && df_height > 1 {
-                    Ok(series.new_from_index(0, df_height))
+                Ok(if series.len() == 1 && df_height > 1 {
+                    series.new_from_index(0, df_height)
                 } else if series.len() == df_height || series.len() == 0 {
-                    Ok(series)
+                    series
                 } else {
-                    Err(PolarsError::ComputeError(
-                        format!(
-                            "Series {series:?} does not match the DataFrame height of {df_height}",
-                        )
-                        .into(),
-                    ))
-                }
+                    polars_bail!(
+                        ComputeError: "series length {} doesn't match the dataframe height of {}",
+                        series.len(), df_height
+                    );
+                })
             })
             .collect::<PolarsResult<_>>()?
     }

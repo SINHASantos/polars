@@ -1,8 +1,10 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(feature = "simd", feature(portable_simd))]
+#![allow(ambiguous_glob_reexports)]
 
 #[cfg(feature = "avro")]
 pub mod avro;
-#[cfg(feature = "async")]
+#[cfg(feature = "cloud")]
 mod cloud;
 #[cfg(any(feature = "csv-file", feature = "json"))]
 pub mod csv;
@@ -14,7 +16,7 @@ pub mod ipc;
 pub mod json;
 #[cfg(feature = "json")]
 pub mod ndjson_core;
-#[cfg(feature = "async")]
+#[cfg(feature = "cloud")]
 pub use crate::cloud::glob as async_glob;
 
 #[cfg(any(
@@ -46,7 +48,6 @@ use std::path::{Path, PathBuf};
 use arrow::array::new_empty_array;
 use arrow::error::Result as ArrowResult;
 pub use options::*;
-use polars_core::config::verbose;
 use polars_core::frame::ArrowChunk;
 use polars_core::prelude::*;
 
@@ -138,7 +139,7 @@ pub(crate) fn finish_reader<R: ArrowReader>(
                     .iter()
                     .map(|df: &DataFrame| df.height())
                     .sum::<usize>();
-                if verbose() {
+                if polars_core::config::verbose() {
                     eprintln!("sliced off {} rows of the 'DataFrame'. These lines were read because they were in a single chunk.", df.height() - n)
                 }
                 parsed_dfs.push(df.slice(0, len));

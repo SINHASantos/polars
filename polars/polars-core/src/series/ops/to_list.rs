@@ -37,7 +37,7 @@ impl Series {
         let offsets = vec![0i64, values.len() as i64];
         let inner_type = self.dtype();
 
-        let data_type = ListArray::<i64>::default_datatype(inner_type.to_physical().to_arrow());
+        let data_type = ListArray::<i64>::default_datatype(values.data_type().clone());
 
         // Safety:
         // offsets are correct;
@@ -52,9 +52,7 @@ impl Series {
         let name = self.name();
 
         let mut ca = unsafe { ListChunked::from_chunks(name, vec![Box::new(arr)]) };
-        if self.dtype() != &self.dtype().to_physical() {
-            ca.to_logical(inner_type.clone())
-        }
+        ca.to_logical(inner_type.clone());
         ca.set_fast_explode();
 
         Ok(ca)
@@ -91,12 +89,10 @@ impl Series {
         }
 
         let prod = dims.iter().product::<i64>() as usize;
-        if prod != s_ref.len() {
-            return Err(PolarsError::ComputeError(
-                format!("cannot reshape len {} into shape {:?}", s_ref.len(), dims).into(),
-            ));
-        }
-
+        polars_ensure!(
+            prod == s_ref.len(),
+            ComputeError: "cannot reshape len {} into shape {:?}", s_ref.len(), dims,
+        );
         match dims.len() {
             1 => Ok(s_ref.slice(0, dims[0] as usize)),
             2 => {

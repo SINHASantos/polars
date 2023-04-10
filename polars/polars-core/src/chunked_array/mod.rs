@@ -37,6 +37,7 @@ mod random;
     feature = "dtype-date"
 ))]
 pub mod temporal;
+mod to_vec;
 mod trusted_len;
 pub mod upstream_traits;
 
@@ -275,20 +276,15 @@ impl<T: PolarsDataType> ChunkedArray<T> {
 
     /// Series to ChunkedArray<T>
     pub fn unpack_series_matching_type(&self, series: &Series) -> PolarsResult<&ChunkedArray<T>> {
-        if self.dtype() == series.dtype() {
-            // Safety
-            // dtype will be correct.
-            Ok(unsafe { self.unpack_series_matching_physical_type(series) })
-        } else {
-            Err(PolarsError::SchemaMisMatch(
-                format!(
-                    "cannot unpack series {:?} into matching type {:?}",
-                    series,
-                    self.dtype()
-                )
-                .into(),
-            ))
-        }
+        polars_ensure!(
+            self.dtype() == series.dtype(),
+            SchemaMismatch: "cannot unpack series of type `{}` into `{}`",
+            series.dtype(),
+            self.dtype(),
+        );
+        // Safety
+        // dtype will be correct.
+        Ok(unsafe { self.unpack_series_matching_physical_type(series) })
     }
 
     /// Unique id representing the number of chunks
@@ -344,65 +340,6 @@ impl<T: PolarsDataType> ChunkedArray<T> {
             out.unset_fast_explode_list()
         }
         out
-    }
-
-    /// Get a mask of the null values.
-    pub fn is_null(&self) -> BooleanChunked {
-        if !self.has_validity() {
-            return BooleanChunked::full(self.name(), false, self.len());
-        }
-        let chunks = self
-            .chunks
-            .iter()
-            .map(|arr| {
-                let bitmap = arr
-                    .validity()
-                    .map(|bitmap| !bitmap)
-                    .unwrap_or_else(|| Bitmap::new_zeroed(arr.len()));
-                Box::new(BooleanArray::from_data_default(bitmap, None)) as ArrayRef
-            })
-            .collect::<Vec<_>>();
-        unsafe { BooleanChunked::from_chunks(self.name(), chunks) }
-    }
-
-    /// Get a mask of the valid values.
-    pub fn is_not_null(&self) -> BooleanChunked {
-        if !self.has_validity() {
-            return BooleanChunked::full(self.name(), true, self.len());
-        }
-        let chunks = self
-            .chunks
-            .iter()
-            .map(|arr| {
-                let bitmap = arr
-                    .validity()
-                    .cloned()
-                    .unwrap_or_else(|| !(&Bitmap::new_zeroed(arr.len())));
-                Box::new(BooleanArray::from_data_default(bitmap, None)) as ArrayRef
-            })
-            .collect::<Vec<_>>();
-        unsafe { BooleanChunked::from_chunks(self.name(), chunks) }
-    }
-
-    pub(crate) fn coalesce_nulls(&self, other: &[ArrayRef]) -> Self {
-        assert_eq!(self.chunks.len(), other.len());
-        let chunks = self
-            .chunks
-            .iter()
-            .zip(other)
-            .map(|(a, b)| {
-                assert_eq!(a.len(), b.len());
-                let validity = match (a.validity(), b.validity()) {
-                    (None, Some(b)) => Some(b.clone()),
-                    (Some(a), Some(b)) => Some(a & b),
-                    (Some(a), None) => Some(a.clone()),
-                    (None, None) => None,
-                };
-
-                a.with_validity(validity)
-            })
-            .collect();
-        self.copy_with_chunks(chunks, true, false)
     }
 
     /// Get data type of ChunkedArray.
@@ -466,12 +403,16 @@ where
     }
 }
 
-pub(crate) trait AsSinglePtr {
+impl<T: PolarsDataType> AsRefDataType for ChunkedArray<T> {
+    fn as_ref_dtype(&self) -> &DataType {
+        self.dtype()
+    }
+}
+
+pub(crate) trait AsSinglePtr: AsRefDataType {
     /// Rechunk and return a ptr to the start of the array
     fn as_single_ptr(&mut self) -> PolarsResult<usize> {
-        Err(PolarsError::InvalidOperation(
-            "operation as_single_ptr not supported for this dtype".into(),
-        ))
+        polars_bail!(opq = as_single_ptr, self.as_ref_dtype());
     }
 }
 
@@ -491,7 +432,6 @@ where
 impl AsSinglePtr for BooleanChunked {}
 impl AsSinglePtr for ListChunked {}
 impl AsSinglePtr for Utf8Chunked {}
-#[cfg(feature = "dtype-binary")]
 impl AsSinglePtr for BinaryChunked {}
 #[cfg(feature = "object")]
 impl<T: PolarsObject> AsSinglePtr for ObjectChunked<T> {}
@@ -502,12 +442,13 @@ where
 {
     /// Contiguous slice
     pub fn cont_slice(&self) -> PolarsResult<&[T::Native]> {
-        if self.chunks.len() == 1 && self.chunks[0].null_count() == 0 {
-            Ok(self.downcast_iter().next().map(|arr| arr.values()).unwrap())
-        } else {
-            Err(PolarsError::ComputeError("no_slice".into()))
-        }
+        polars_ensure!(
+            self.chunks.len() == 1 && self.chunks[0].null_count() == 0,
+            ComputeError: "chunked array is not contiguous"
+        );
+        Ok(self.downcast_iter().next().map(|arr| arr.values()).unwrap())
     }
+
     /// Contiguous mutable slice
     pub(crate) fn cont_slice_mut(&mut self) -> Option<&mut [T::Native]> {
         if self.chunks.len() == 1 && self.chunks[0].null_count() == 0 {
@@ -582,7 +523,6 @@ impl ValueSize for Utf8Chunked {
     }
 }
 
-#[cfg(feature = "dtype-binary")]
 impl ValueSize for BinaryChunked {
     fn get_values_size(&self) -> usize {
         self.chunks
@@ -648,7 +588,7 @@ pub(crate) mod test {
         let a = a.sort(false);
         let b = a.into_iter().collect::<Vec<_>>();
         assert_eq!(b, [Some("a"), Some("b"), Some("c")]);
-        assert_eq!(a.is_sorted_ascending_flag(), true);
+        assert!(a.is_sorted_ascending_flag());
     }
 
     #[test]
